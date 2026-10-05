@@ -1,0 +1,16 @@
+# CLion
+.idea/
+cmake-build-*/
+build/
+cmake/
+
+# CubeMX
+.mxproject
+
+# 编译输出
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.list

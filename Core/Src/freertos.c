@@ -1,0 +1,390 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * File Name          : freertos.c
+  * Description        : Code for freertos applications
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN Variables */
+
+/* USER CODE END Variables */
+/* Definitions for ChassisControlT */
+osThreadId_t ChassisControlTHandle;
+const osThreadAttr_t ChassisControlT_attributes = {
+  .name = "ChassisControlT",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityHigh7,
+};
+/* Definitions for ActuatorTask */
+osThreadId_t ActuatorTaskHandle;
+const osThreadAttr_t ActuatorTask_attributes = {
+  .name = "ActuatorTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow5,
+};
+/* Definitions for SafetyTask */
+osThreadId_t SafetyTaskHandle;
+const osThreadAttr_t SafetyTask_attributes = {
+  .name = "SafetyTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityHigh1,
+};
+/* Definitions for SensorImuTask */
+osThreadId_t SensorImuTaskHandle;
+const osThreadAttr_t SensorImuTask_attributes = {
+  .name = "SensorImuTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal6,
+};
+/* Definitions for SensorPowerTask */
+osThreadId_t SensorPowerTaskHandle;
+const osThreadAttr_t SensorPowerTask_attributes = {
+  .name = "SensorPowerTask",
+  .stack_size = 768 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal3,
+};
+/* Definitions for GrabTask */
+osThreadId_t GrabTaskHandle;
+const osThreadAttr_t GrabTask_attributes = {
+  .name = "GrabTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal3,
+};
+/* Definitions for RemoteTask */
+osThreadId_t RemoteTaskHandle;
+const osThreadAttr_t RemoteTask_attributes = {
+  .name = "RemoteTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+/* Definitions for PoseTask */
+osThreadId_t PoseTaskHandle;
+const osThreadAttr_t PoseTask_attributes = {
+  .name = "PoseTask",
+  .stack_size = 768 * 4,
+  .priority = (osPriority_t) osPriorityNormal7,
+};
+/* Definitions for StrategyTask */
+osThreadId_t StrategyTaskHandle;
+const osThreadAttr_t StrategyTask_attributes = {
+  .name = "StrategyTask",
+  .stack_size = 768 * 4,
+  .priority = (osPriority_t) osPriorityNormal5,
+};
+/* Definitions for TelemetryTask */
+osThreadId_t TelemetryTaskHandle;
+const osThreadAttr_t TelemetryTask_attributes = {
+  .name = "TelemetryTask",
+  .stack_size = 768 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+/* Private function prototypes -----------------------------------------------*/
+/* USER CODE BEGIN FunctionPrototypes */
+
+/* USER CODE END FunctionPrototypes */
+
+void StartChassisControlTask(void *argument);
+void StartActuatorTask(void *argument);
+void StartSafetyTask(void *argument);
+void StartSensorImuTask(void *argument);
+void StartSensorPower(void *argument);
+void StartGrabTask(void *argument);
+void StartRemoteTask(void *argument);
+void StarPoseTask(void *argument);
+void StartStrategyTask(void *argument);
+void StartTelemetryTask(void *argument);
+
+void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
+
+/**
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of ChassisControlT */
+  ChassisControlTHandle = osThreadNew(StartChassisControlTask, NULL, &ChassisControlT_attributes);
+
+  /* creation of ActuatorTask */
+  ActuatorTaskHandle = osThreadNew(StartActuatorTask, NULL, &ActuatorTask_attributes);
+
+  /* creation of SafetyTask */
+  SafetyTaskHandle = osThreadNew(StartSafetyTask, NULL, &SafetyTask_attributes);
+
+  /* creation of SensorImuTask */
+  SensorImuTaskHandle = osThreadNew(StartSensorImuTask, NULL, &SensorImuTask_attributes);
+
+  /* creation of SensorPowerTask */
+  SensorPowerTaskHandle = osThreadNew(StartSensorPower, NULL, &SensorPowerTask_attributes);
+
+  /* creation of GrabTask */
+  GrabTaskHandle = osThreadNew(StartGrabTask, NULL, &GrabTask_attributes);
+
+  /* creation of RemoteTask */
+  RemoteTaskHandle = osThreadNew(StartRemoteTask, NULL, &RemoteTask_attributes);
+
+  /* creation of PoseTask */
+  PoseTaskHandle = osThreadNew(StarPoseTask, NULL, &PoseTask_attributes);
+
+  /* creation of StrategyTask */
+  StrategyTaskHandle = osThreadNew(StartStrategyTask, NULL, &StrategyTask_attributes);
+
+  /* creation of TelemetryTask */
+  TelemetryTaskHandle = osThreadNew(StartTelemetryTask, NULL, &TelemetryTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+}
+
+/* USER CODE BEGIN Header_StartChassisControlTask */
+/**
+  * @brief  Function implementing the ChassisControlT thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartChassisControlTask */
+__weak void StartChassisControlTask(void *argument)
+{
+  /* USER CODE BEGIN StartChassisControlTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartChassisControlTask */
+}
+
+/* USER CODE BEGIN Header_StartActuatorTask */
+/**
+* @brief Function implementing the ActuatorTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartActuatorTask */
+__weak void StartActuatorTask(void *argument)
+{
+  /* USER CODE BEGIN StartActuatorTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartActuatorTask */
+}
+
+/* USER CODE BEGIN Header_StartSafetyTask */
+/**
+* @brief Function implementing the SafetyTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartSafetyTask */
+__weak void StartSafetyTask(void *argument)
+{
+  /* USER CODE BEGIN StartSafetyTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartSafetyTask */
+}
+
+/* USER CODE BEGIN Header_StartSensorImuTask */
+/**
+* @brief Function implementing the SensorImuTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartSensorImuTask */
+__weak void StartSensorImuTask(void *argument)
+{
+  /* USER CODE BEGIN StartSensorImuTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartSensorImuTask */
+}
+
+/* USER CODE BEGIN Header_StartSensorPower */
+/**
+* @brief Function implementing the SensorPowerTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartSensorPower */
+__weak void StartSensorPower(void *argument)
+{
+  /* USER CODE BEGIN StartSensorPower */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartSensorPower */
+}
+
+/* USER CODE BEGIN Header_StartGrabTask */
+/**
+* @brief Function implementing the GrabTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartGrabTask */
+__weak void StartGrabTask(void *argument)
+{
+  /* USER CODE BEGIN StartGrabTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartGrabTask */
+}
+
+/* USER CODE BEGIN Header_StartRemoteTask */
+/**
+* @brief Function implementing the RemoteTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartRemoteTask */
+__weak void StartRemoteTask(void *argument)
+{
+  /* USER CODE BEGIN StartRemoteTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartRemoteTask */
+}
+
+/* USER CODE BEGIN Header_StarPoseTask */
+/**
+* @brief Function implementing the PoseTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StarPoseTask */
+__weak void StarPoseTask(void *argument)
+{
+  /* USER CODE BEGIN StarPoseTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StarPoseTask */
+}
+
+/* USER CODE BEGIN Header_StartStrategyTask */
+/**
+* @brief Function implementing the StrategyTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartStrategyTask */
+__weak void StartStrategyTask(void *argument)
+{
+  /* USER CODE BEGIN StartStrategyTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartStrategyTask */
+}
+
+/* USER CODE BEGIN Header_StartTelemetryTask */
+/**
+* @brief Function implementing the TelemetryTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTelemetryTask */
+__weak void StartTelemetryTask(void *argument)
+{
+  /* USER CODE BEGIN StartTelemetryTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartTelemetryTask */
+}
+
+/* Private application code --------------------------------------------------*/
+/* USER CODE BEGIN Application */
+
+/* USER CODE END Application */
+
