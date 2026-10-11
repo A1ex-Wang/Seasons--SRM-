@@ -20,6 +20,7 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "adc.h"
+#include "dma.h"
 #include "i2c.h"
 #include "tim.h"
 #include "usart.h"
@@ -27,7 +28,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "app_types.h" /* App_Init() 与任务入口声明（user/app_types.h）*/
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -92,6 +93,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
@@ -106,7 +108,15 @@ int main(void)
   MX_TIM11_Init();
   MX_TIM13_Init();
   MX_TIM14_Init();
+  MX_TIM1_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+
+  /* 应用层初始化：建静态队列 + 建任务（全部 xTaskCreateStatic，不用 heap）。
+   * 必须在 osKernelStart() 之前调用：任务创建本身不依赖调度器，
+   * 但必须在调度器启动时就已经存在于就绪列表里。
+   * 详见 user/remote.c 的 App_Init()。 */
+  App_Init();
 
   /* USER CODE END 2 */
 

@@ -52,7 +52,25 @@ add_executable(${CMAKE_PROJECT_NAME}
         user/strategy.c
         user/strategy.h
         user/telemetry.c
-        user/telemetry.h)
+        user/telemetry.h
+        user/app_config.h
+        user/app_types.h
+        user/debug_uart.c
+        user/debug_uart.h
+        " Middlewares/Third_Party/SRM/srm_uart.c"
+        " Middlewares/Third_Party/SRM/srm_remote.h"
+        " Middlewares/Third_Party/SRM/srm_protocol.c"
+        " Middlewares/Third_Party/SRM/srm_remote.c"
+        user/control/control_time.c
+        user/control/control_time.h
+        user/control/controller.c
+        user/control/controller.h
+        user/control/encode.c
+        user/control/encode.h
+        user/motor_driver.c
+        user/motor_driver.h
+        user/velocity_control.c
+        user/velocity_control.h)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
@@ -69,12 +87,20 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined include paths
+    # 应用层头文件（app_config.h / app_types.h / remote.h / ...）
+    ${CMAKE_CURRENT_SOURCE_DIR}/user
+    # 上游 SRM v4 协议层头文件（srm_remote.h / srm_protocol.h / srm_uart.h）
+    "${CMAKE_CURRENT_SOURCE_DIR}/ Middlewares/Third_Party/SRM"
 )
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined symbols
+    # 开环标定 / 闭环控制 二选一：
+    #   MOTOR_TEST_MODE = 1 → 四个轮子吃固定占空比（P1 标定用，默认）
+    #   MOTOR_TEST_MODE = 0 → 速度环闭环工作
+    # 不在这里定义时，以 user/app_config.h 里的值为准；
+    # 想不改文件就切换，取消下一行注释即可。
+    # MOTOR_TEST_MODE=0
 )
 
 # Remove wrong libob.a library dependency when using cpp files

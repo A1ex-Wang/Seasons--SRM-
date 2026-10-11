@@ -29,6 +29,7 @@
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
+typedef StaticQueue_t osStaticMessageQDef_t;
 /* USER CODE BEGIN PTD */
 
 /* USER CODE END PTD */
@@ -47,10 +48,10 @@
 /* USER CODE BEGIN Variables */
 
 /* USER CODE END Variables */
-/* Definitions for ChassisControlT */
-osThreadId_t ChassisControlTHandle;
-const osThreadAttr_t ChassisControlT_attributes = {
-  .name = "ChassisControlT",
+/* Definitions for ChassisTask */
+osThreadId_t ChassisTaskHandle;
+const osThreadAttr_t ChassisTask_attributes = {
+  .name = "ChassisTask",
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityHigh7,
 };
@@ -75,10 +76,10 @@ const osThreadAttr_t SensorImuTask_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal6,
 };
-/* Definitions for SensorPowerTask */
-osThreadId_t SensorPowerTaskHandle;
-const osThreadAttr_t SensorPowerTask_attributes = {
-  .name = "SensorPowerTask",
+/* Definitions for OLEDPowerTask */
+osThreadId_t OLEDPowerTaskHandle;
+const osThreadAttr_t OLEDPowerTask_attributes = {
+  .name = "OLEDPowerTask",
   .stack_size = 768 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal3,
 };
@@ -117,17 +118,28 @@ const osThreadAttr_t TelemetryTask_attributes = {
   .stack_size = 768 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for remote_chassis */
+osMessageQueueId_t remote_chassisHandle;
+uint8_t remote_chassisBuffer[ 6 * sizeof( uint16_t ) ];
+osStaticMessageQDef_t remote_chassisControlBlock;
+const osMessageQueueAttr_t remote_chassis_attributes = {
+  .name = "remote_chassis",
+  .cb_mem = &remote_chassisControlBlock,
+  .cb_size = sizeof(remote_chassisControlBlock),
+  .mq_mem = &remote_chassisBuffer,
+  .mq_size = sizeof(remote_chassisBuffer)
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
 /* USER CODE END FunctionPrototypes */
 
-void StartChassisControlTask(void *argument);
+void StartChassisTask(void *argument);
 void StartActuatorTask(void *argument);
 void StartSafetyTask(void *argument);
 void StartSensorImuTask(void *argument);
-void StartSensorPower(void *argument);
+void StartOLEDPower(void *argument);
 void StartGrabTask(void *argument);
 void StartRemoteTask(void *argument);
 void StarPoseTask(void *argument);
@@ -158,13 +170,17 @@ void MX_FREERTOS_Init(void) {
   /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
 
+  /* Create the queue(s) */
+  /* creation of remote_chassis */
+  remote_chassisHandle = osMessageQueueNew (6, sizeof(uint16_t), &remote_chassis_attributes);
+
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of ChassisControlT */
-  ChassisControlTHandle = osThreadNew(StartChassisControlTask, NULL, &ChassisControlT_attributes);
+  /* creation of ChassisTask */
+  ChassisTaskHandle = osThreadNew(StartChassisTask, NULL, &ChassisTask_attributes);
 
   /* creation of ActuatorTask */
   ActuatorTaskHandle = osThreadNew(StartActuatorTask, NULL, &ActuatorTask_attributes);
@@ -175,8 +191,8 @@ void MX_FREERTOS_Init(void) {
   /* creation of SensorImuTask */
   SensorImuTaskHandle = osThreadNew(StartSensorImuTask, NULL, &SensorImuTask_attributes);
 
-  /* creation of SensorPowerTask */
-  SensorPowerTaskHandle = osThreadNew(StartSensorPower, NULL, &SensorPowerTask_attributes);
+  /* creation of OLEDPowerTask */
+  OLEDPowerTaskHandle = osThreadNew(StartOLEDPower, NULL, &OLEDPowerTask_attributes);
 
   /* creation of GrabTask */
   GrabTaskHandle = osThreadNew(StartGrabTask, NULL, &GrabTask_attributes);
@@ -203,22 +219,22 @@ void MX_FREERTOS_Init(void) {
 
 }
 
-/* USER CODE BEGIN Header_StartChassisControlTask */
+/* USER CODE BEGIN Header_StartChassisTask */
 /**
-  * @brief  Function implementing the ChassisControlT thread.
+  * @brief  Function implementing the ChassisTask thread.
   * @param  argument: Not used
   * @retval None
   */
-/* USER CODE END Header_StartChassisControlTask */
-__weak void StartChassisControlTask(void *argument)
+/* USER CODE END Header_StartChassisTask */
+__weak void StartChassisTask(void *argument)
 {
-  /* USER CODE BEGIN StartChassisControlTask */
+  /* USER CODE BEGIN StartChassisTask */
   /* Infinite loop */
   for(;;)
   {
     osDelay(1);
   }
-  /* USER CODE END StartChassisControlTask */
+  /* USER CODE END StartChassisTask */
 }
 
 /* USER CODE BEGIN Header_StartActuatorTask */
@@ -275,22 +291,22 @@ __weak void StartSensorImuTask(void *argument)
   /* USER CODE END StartSensorImuTask */
 }
 
-/* USER CODE BEGIN Header_StartSensorPower */
+/* USER CODE BEGIN Header_StartOLEDPower */
 /**
-* @brief Function implementing the SensorPowerTask thread.
+* @brief Function implementing the OLEDPowerTask thread.
 * @param argument: Not used
 * @retval None
 */
-/* USER CODE END Header_StartSensorPower */
-__weak void StartSensorPower(void *argument)
+/* USER CODE END Header_StartOLEDPower */
+__weak void StartOLEDPower(void *argument)
 {
-  /* USER CODE BEGIN StartSensorPower */
+  /* USER CODE BEGIN StartOLEDPower */
   /* Infinite loop */
   for(;;)
   {
     osDelay(1);
   }
-  /* USER CODE END StartSensorPower */
+  /* USER CODE END StartOLEDPower */
 }
 
 /* USER CODE BEGIN Header_StartGrabTask */
