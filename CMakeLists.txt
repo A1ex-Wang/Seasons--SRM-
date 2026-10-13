@@ -47,8 +47,8 @@ add_executable(${CMAKE_PROJECT_NAME}
         user/pose.h
         user/grab.c
         user/grab.h
-        user/sensorpower.c
-        user/sensorpower.h
+        user/OLEDpower.c
+        user/OLEDpower.h
         user/strategy.c
         user/strategy.h
         user/telemetry.c
@@ -70,7 +70,12 @@ add_executable(${CMAKE_PROJECT_NAME}
         user/motor_driver.c
         user/motor_driver.h
         user/velocity_control.c
-        user/velocity_control.h)
+        user/velocity_control.h
+        user/ssd1306/ssd1306.c
+        user/ssd1306/ssd1306_conf.h
+        user/ssd1306/ssd1306_fonts.c
+        user/ssd1306/ssd1306_fonts.h
+)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
