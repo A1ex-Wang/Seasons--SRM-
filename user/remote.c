@@ -34,6 +34,7 @@
 #include "chassiscontrol.h"
 #include "debug_uart.h"
 #include "safety.h"
+#include "OLEDpower.h" /* OLEDPower_Init()：ADC+DMA 启动 + 电流零点校准 + 建 OLED 数显任务 */
 
 /*============================================================================*/
 /* 静态对象：队列                                                              */
@@ -340,6 +341,19 @@ void App_Init(void) {
      * printf 走 USART6（独立于蓝牙口）。CubeMX 已经初始化了 USART6 的引脚与
      * 时钟，这里只统一波特率，必须在任何 printf 之前调用。 */
     DebugUart_Init();
+
+    /* ── 第 0.5 步：OLED 数显模块的硬件初始化（必须在调度器启动前调用）─────
+     * 只做三件事，**完全不涉及底盘控制与蓝牙协议**：
+     *   1) 启动 ADC3 + DMA2_Stream0（循环模式）。CubeMX 只生成了配置函数
+     *      MX_ADC3_Init()，全工程没有任何地方调用 HAL_ADC_Start_DMA()，
+     *      不启动则 OLED 上的电压/电流/功率/电量永远是 0；
+     *   2) 电流零点校准：要求"电机肯定没转"。TB6612 的 STBY 是硬件接 3V3、
+     *      软件关不掉（见 app_config.h 第 9 节），只能抢在 Chassis 任务被创建
+     *      之前、即 PWM 从未输出过的时间窗口里采样；
+     *   3) 建 OLEDPower 任务（静态分配，优先级 35 < Chassis 47，
+     *      不会抢占速度环）。
+     * 该函数不做任何 PWM / 方向脚 / 串口操作，也不消费 q_remote_cmd。 */
+    OLEDPower_Init();
 
     /* ── 第 1 步：先建队列 ──────────────────────────────────────────────────
      * 顺序要求：队列先于任务。这样两个任务开始运行时队列一定已经存在，

@@ -374,4 +374,116 @@ APP_STATIC_ASSERT((MOTOR_DEADBAND_FR < MOTOR_PWM_FULL), "MOTOR_DEADBAND_FR out o
 APP_STATIC_ASSERT((MOTOR_DEADBAND_RL < MOTOR_PWM_FULL), "MOTOR_DEADBAND_RL out of range");
 APP_STATIC_ASSERT((MOTOR_DEADBAND_RR < MOTOR_PWM_FULL), "MOTOR_DEADBAND_RR out of range");
 
+/*============================================================================*/
+/* 14. 电池功率与电量监控（ADC3 + INA240A1 + SSD1306）                          */
+/*============================================================================*/
+
+/* 本节全部是 OLED 数显模块（user/OLEDpower.c）的编译期参数。
+ * 与第 1~13 节的底盘/遥控参数完全无关，改动本节不会影响运动学、速度环、
+ * 编码器或蓝牙协议解析。 */
+
+/* 硬件链条（已实测确认；换硬件时只改本节前面几个宏，算法不用动）：
+ *
+ *   电池 ──[1 mΩ 采样电阻]── 负载
+ *              │
+ *         INA240A1（增益 20 V/V，REF1 = REF2 = GND → **单向**检测）
+ *              │  输出 0 V(0 A) … 3.3 V(165 A)，零点无偏置
+ *           PF3 = ADC3_IN9      → 电流通道（规则组 rank1）
+ *
+ *   电池 ──[100 kΩ ±5%]──┬──[10 kΩ ±1%]── GND
+ *                        │
+ *                    PF4 = ADC3_IN14 → 电压通道（规则组 rank2，分压比 11 : 1）
+ *
+ * ★ REF 接地带来的三个后果（与常见 VCC/2 双向接法不同，务必理解）：
+ *   1) 零电流时运放输出 ≈ 0 V，不是 1.65 V，所以电流**恒为非负**；
+ *      代码仍按带符号处理并做下限幅；
+ *   2) 运放输出贴近地轨时线性度变差（输出下限约 10 mV → 折合 0.5 A），
+ *      因此 0.5 A 以下不保证精度，也不参与电量更新；
+ *   3) 满量程 = 3.3 V / 0.02 V/A = 165 A，远超实际电流，无饱和风险。 */
+
+#define POWER_SHUNT_OHM 0.001f /* 采样电阻 1 mΩ（硬件不可改，已确认） */
+#define POWER_AMP_GAIN 20.0f   /* INA240A1 增益 20 V/V */
+/* 采样电阻 + 运放合并后的转换系数：I[A] = (V_adc − V_zero) / POWER_AMPS_TO_VOLTS */
+#define POWER_AMPS_TO_VOLTS (POWER_SHUNT_OHM * POWER_AMP_GAIN) /* = 0.02 V/A */
+
+/* 1 = 双向（REF 接 VCC/2），0 = 单向（REF 接 GND，本工程当前硬件）。
+ * 置 0 时负电流被限幅到 POWER_CURRENT_FLOOR_A。 */
+#define POWER_CURRENT_BIDIRECTIONAL 0
+
+/* 分压比 = (100k + 10k) / 10k = 11.0。
+ * ⚠ 精度提醒：100 kΩ 是 ±5%、10 kΩ 是 ±1%，最坏情况下分压比落在 10.52…11.61
+ * （约 ±5.5% 误差），已经吃掉一半的 ±10% 指标预算。后续实测修正时直接改这个
+ * 数字（例如实测比值 11.08 就写 11.08f），不要改公式。 */
+#define POWER_DIVIDER_RATIO 11.0f
+
+/* ADC 参考电压。暂按 3.3 V；实测 VREF+ 后改成实测值（例如 3.287f）。
+ * 它是全链路的比例因子，偏 3% 则电压/电流/功率一起偏 3%。 */
+#define POWER_ADC_VREF 3.3f
+#define POWER_ADC_FULL_SCALE 4095.0f /* 12 位，右对齐 */
+
+/* 电流下限（A）。单向检测没有负电流，低于 0 一律归零。 */
+#define POWER_CURRENT_FLOOR_A 0.0f
+
+/* 零点校准采样次数：在调度器启动前（PWM 从未输出过，物理上必然零电流）
+ * 连续采样求平均赋给 zero_offset_v。100 次求平均把量化噪声压到 0.1 LSB 量级。 */
+#define POWER_ZERO_CAL_SAMPLES 100u
+
+/* 过采样窗长（ms）。ADC3 在 DMA 循环模式下自由运行，采样率由 adc.c 的配置决定：
+ *     f_ADCCLK = PCLK2 / 6 = 84 MHz / 6 = 14 MHz
+ *     单通道转换 = 144(采样) + 12(12 位逐次逼近) = 156 个 ADC 周期 ≈ 11.1 µs
+ *     一轮扫描 = 2 个通道 ≈ 22.3 µs  →  **约 45 kHz**，DMA 完成中断同频
+ * 也就是说 10 ms 窗内约有 450 轮转换（900 个采样点）。
+ * DMA 完成中断里只做整数累加、不做任何浮点，任务每 10 ms 取一次均值，
+ * 量化噪声按 √450 ≈ 21 倍下降 —— 这是把「1 LSB = 40 mA」这个硬分辨率救回来的
+ * 关键手段，也是守住 ±10% 的必要条件。 */
+#define POWER_SAMPLE_PERIOD_MS 10u
+
+/* 一阶低通「守旧系数」（0~1，越大越平滑）。等价时间常数：
+ *     τ = dt × alpha / (1 − alpha)，alpha = 0.90、dt = 10 ms → τ ≈ 90 ms
+ * 注意 dt 是 10 ms，所以 τ 是**毫秒**量级，不是"90 秒"。
+ * alpha 再往上加（0.99 → τ ≈ 1 s）会让电量显示严重滞后，不建议。 */
+#define POWER_LPF_ALPHA 0.90f
+
+/* 电量百分比映射端点（3S 锂电池：满 12.6 V / 空 10.5 V）。
+ * ⚠ 这是很粗的模型：锂电放电曲线中段平坦，线性映射误差远大于显示精度，
+ * 它只能当"还能不能跑"的粗略指示，不是真实 SOC。要更准需库仑积分或分段查表。 */
+#define POWER_V_FULL 12.6f
+#define POWER_V_EMPTY 10.5f
+
+/* 只有在电流小于该值时才更新电量百分比：急加速时电池被拉低，
+ * 此时若更新，电量会跟着油门一起狂掉。0.5 A 同时是运放近地轨的精度下限。 */
+#define POWER_SOC_UPDATE_MAX_A 0.5f
+
+/* ── OLED 任务参数 ────────────────────────────────────────────────────────── */
+#define OLED_POWER_PERIOD_MS POWER_SAMPLE_PERIOD_MS /* 10 ms 严格周期 */
+
+/* 刷屏分频：10 次 × 10 ms = 100 ms 刷一次（10 Hz）。
+ * ★ 分频改变不了"那一次刷屏"的耗时：ssd1306_UpdateScreen() 要在 400 kHz 下
+ *   发 1024 字节数据 + 24 字节命令，实测约 25 ms 阻塞。期间 vTaskDelayUntil
+ *   会顺延 2~3 个 tick。这是把 I2C 屏塞进 10 ms 任务的固有代价，换来的是
+ *   "不丢采样"——采样由 DMA + 中断累加，任务晚一点取均值不影响结果。 */
+#define OLED_REFRESH_DIVIDER 10u
+
+/* 任务栈（字）与优先级。任务用 xTaskCreateStatic 静态创建（不占 FreeRTOS heap），
+ * 优先级 35 与 CubeMX 里 OLEDPowerTask 的 osPriorityAboveNormal3 一致：
+ * 高于 Remote(26)，低于 Chassis(32)……注意数值越大优先级越高，所以实际是
+ * **低于 Chassis(32/Raw=47)、低于 Safety、高于 Remote**，不会抢占速度环。 */
+#define STACK_OLEDPOWER_WORDS 768u
+#define PRIO_OLEDPOWER 35u
+#define NAME_OLEDPOWER "OLEDPower"
+
+/* ── 本节自检 ─────────────────────────────────────────────────────────────── */
+APP_STATIC_ASSERT((POWER_SHUNT_OHM > 0.0f), "POWER_SHUNT_OHM must be > 0");
+APP_STATIC_ASSERT((POWER_AMP_GAIN > 0.0f), "POWER_AMP_GAIN must be > 0");
+APP_STATIC_ASSERT((POWER_DIVIDER_RATIO > 1.0f),
+                  "POWER_DIVIDER_RATIO must be > 1 (it is a step-down divider)");
+APP_STATIC_ASSERT((POWER_ADC_VREF > 0.0f), "POWER_ADC_VREF must be > 0");
+APP_STATIC_ASSERT((POWER_ADC_FULL_SCALE > 0.0f), "POWER_ADC_FULL_SCALE must be > 0");
+APP_STATIC_ASSERT((POWER_ZERO_CAL_SAMPLES > 0u), "POWER_ZERO_CAL_SAMPLES must be > 0");
+APP_STATIC_ASSERT((POWER_SAMPLE_PERIOD_MS > 0u), "POWER_SAMPLE_PERIOD_MS must be > 0");
+APP_STATIC_ASSERT((POWER_LPF_ALPHA > 0.0f) && (POWER_LPF_ALPHA < 1.0f),
+                  "POWER_LPF_ALPHA must be in (0, 1) or the filter is unstable");
+APP_STATIC_ASSERT((POWER_V_FULL > POWER_V_EMPTY), "POWER_V_FULL must be above POWER_V_EMPTY");
+APP_STATIC_ASSERT((OLED_REFRESH_DIVIDER > 0u), "OLED_REFRESH_DIVIDER must be > 0");
+
 #endif /* ROBO_APP_CONFIG_H */

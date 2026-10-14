@@ -94,6 +94,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # 应用层头文件（app_config.h / app_types.h / remote.h / ...）
     ${CMAKE_CURRENT_SOURCE_DIR}/user
+    # SSD1306 OLED 驱动头文件（ssd1306.h / ssd1306_conf.h / ssd1306_fonts.h）。
+    # 缺这一行时 user/OLEDpower.c 的 #include "ssd1306.h" 会“找不到文件”。
+    # 注意 ssd1306_conf.h 内部还会 #include "i2c.h"，那个由 Core/Inc 提供。
+    ${CMAKE_CURRENT_SOURCE_DIR}/user/ssd1306
     # 上游 SRM v4 协议层头文件（srm_remote.h / srm_protocol.h / srm_uart.h）
     "${CMAKE_CURRENT_SOURCE_DIR}/ Middlewares/Third_Party/SRM"
 )

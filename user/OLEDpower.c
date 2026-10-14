@@ -399,6 +399,12 @@ static void OLED_ShowFloat(uint8_t x, uint8_t y, float value, SSD1306_Font_t fon
     /* ④ 只格式化整数 */
     (void)snprintf(buf, sizeof(buf), "%s%ld.%02ld", sign, (long)whole, (long)frac);
 
+    /* ⑤ 定位光标再写。
+     * ★ 这一步不能省：库的 ssd1306_WriteString() 没有坐标参数，它从 SSD1306
+     *   内部的 CurrentX/CurrentY 接着写，所以必须先 SetCursor，
+     *   否则会从上次写到的位置继续输出（表现为文字乱串）。 */
+    ssd1306_SetCursor(x, y);
+
     /* ssd1306_WriteString() 的形参不是 const char*，需要显式去 const */
     (void)ssd1306_WriteString(buf, font, color);
 }
@@ -595,7 +601,19 @@ void StartOLEDPower(void *argument)
     /* ── 第 2 步：初始化 OLED ──────────────────────────────────────────────
      * ssd1306_Init() 内部有 HAL_Delay(100) 与几十条 I2C 命令，必须在任务上下文
      * 里调用（这样调试器能停住，看门狗也能看到这个任务在跑）。整个初始化约
-     * 130 ms，只在启动时发生一次。 */
+     * 130 ms，只在启动时发生一次。
+     *
+     * ★ 对其它任务的影响（已核实，结论：无影响）：
+     *   这 130 ms 发生在本任务刚被调度起来的时候，此刻**调度器早已启动**，所以
+     *   它确实会占住 CPU 不让出。但要注意优先级关系：本任务为
+     *   PRIO_OLEDPOWER(35)，Safety(41) / Chassis(47) / SensorImu(38) 都比它高，
+     *   随时可以抢占，因此**底盘速度环与安全任务完全不受影响**；
+     *   唯一被压住的是 Remote 蓝牙解析任务（优先级 26，低于本任务）。
+     *   即使被压住 130 ms，也只是"上电后头一两帧遥控帧晚到 0.13 s"：
+     *   SRM 上游按包头 + CRC 同步，USART2 的 DMA 环形缓冲（256 B）绕回来也
+     *   只会丢帧、不会解析出乱码。所以这是可接受的启动代价。
+     *   （若想彻底消除，把 PRIO_OLEDPOWER 降到 26 以下即可，代价是刷屏更容易
+     *   被蓝牙/遥测任务挤后 —— 但刷屏是 10 Hz 的显示，晚一点毫无影响。） */
     if (xSemaphoreTake(g_i2c1_mutex, portMAX_DELAY) == pdTRUE) {
         ssd1306_Init();
         oled_show_banner();
@@ -622,9 +640,14 @@ void StartOLEDPower(void *argument)
         if (divider >= OLED_REFRESH_DIVIDER) {
             divider = 0u;
 
-            /* 拿 I2C1 总线锁。本工程 IMU 走 I2C2，这里的竞争者只有以后新加到
-             * I2C1 上的设备，用 portMAX_DELAY 即可。 */
-            if (xSemaphoreTake(g_i2c1_mutex, portMAX_DELAY) == pdTRUE) {
+            /* 拿 I2C1 总线锁。本工程 IMU 走 I2C2（不是 I2C1），唯一的竞争者
+             * 只有以后新加到 I2C1 上的设备，所以这里正常是"零等待"。
+             *
+             * 刻意**不用 portMAX_DELAY**：万一以后有别的任务拿住 I2C1 不放，
+             * 本任务优先级(35)高于 Remote(26)，若无限等待就会连带把蓝牙解析
+             * 一起饿住。限时 200 ms（约 2 帧刷屏周期）后放弃这一帧，
+             * 下一帧（100 ms 后）自然重试，界面只是偶尔不更新，不会拖垮系统。 */
+            if (xSemaphoreTake(g_i2c1_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
                 oled_render();
                 (void)xSemaphoreGive(g_i2c1_mutex);
             }
