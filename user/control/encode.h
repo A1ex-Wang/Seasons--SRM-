@@ -8,8 +8,10 @@
   *      不再使用文件级 static 单例（原版只能带一个编码器）；
   *   2) **符号可标定**：sign 取自 app_config.h 的 MOTOR_SIGN_ENC_*，
   *      用来把“编码器计数增减”统一成“该轮物理前进为正”；
-  *   3) **测速窗口由内部分频**：Encode_Update() 每 1 ms 被调用累积计数，
-  *      每 ENCODE_WINDOW_MS 才计算一次速度。这样调用方不需要额外分频。
+  *   3) **测速窗口由调用方给出真实时间**：Encode_Update(enc, dt_ms) 必须传入
+  *      距上次调用的实际毫秒数。本工程速度环是 10 ms 一次，所以每次传 10。
+  *      （历史坑：这里曾按"调用一次=1 ms"写死累加 +1，导致窗口变成 10 倍长、
+  *        速度读数放大 10 倍，进而让 PID 输出饱和、电机狂转。）
   *
   * 为什么不能用“输入捕获测周法（T 法）”：
   *   本工程的四路编码器占满了 TIM1/2/3/4 的 CH1 与 CH2（A 相进 CH1、B 相进 CH2），
@@ -73,12 +75,20 @@ void Encode_Start(Encode_t *enc);
 void Encode_Reset(Encode_t *enc);
 
 /**
-  * @brief 每 1 ms 调用一次：读取计数增量；到窗口末尾时计算并更新速度。
+  * @brief 读取计数增量并推进测速窗口。
   *
-  * 内部按 elapsed_ms 累加，达到 window_ms 时才做一次除法与滤波，
-  * 因此调用方可以无脑每毫秒调用它。
+  * ★ 必须传入**真实的**经过时间 dt_ms，不能假设"调用一次就是 1 ms" ★
+  *   本工程的速度环（以及这里的调用）是**每 VEL_LOOP_PERIOD_MS = 10 ms**
+  *   才执行一次，所以每次调用要让 elapsed_ms += 10。
+  *   如果这里写死 += 1，编码器会以为过了 10 ms、实际过了 100 ms，
+  *   窗口时长变成 10 倍、速度读数也**放大 10 倍**
+  *   —— 这正是本工程踩过的坑（表现为 measure 比实际大一个数量级、
+  *      PID 误判后输出饱和、电机狂转）。
+  *
+  * @param enc    编码器实例
+  * @param dt_ms  距上一次调用的实际毫秒数（调用方用 tick 差值算出来）
   */
-void Encode_Update(Encode_t *enc);
+void Encode_Update(Encode_t *enc, uint32_t dt_ms);
 
 /** @brief 取累计位置（有符号计数，已按 sign 统一方向）。 */
 int32_t Encode_GetCount(const Encode_t *enc);

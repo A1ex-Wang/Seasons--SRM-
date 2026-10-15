@@ -53,7 +53,22 @@ void PIDReset(PIDInstance *pid) {
     pid->Output = 0.0f;
     pid->Last_Output = 0.0f;
     pid->Last_Dout = 0.0f;
+    pid->FeedForward = 0.0f;
+    pid->IntegralHold = 0u;
     pid->initialized = 0U;
+}
+
+void PID_FreezeIntegral(PIDInstance *pid) {
+    if (pid == NULL) return;
+
+    /* Iout 非有限值（NaN/Inf，例如曾经被坏采样污染过）时直接清零，
+     * 否则任何限幅比较都会失效，积分就再也管不住了。 */
+    if (!isfinite(pid->Iout)) {
+        pid->Iout = 0.0f;
+    }
+    /* 只置标志：PIDCalculate() 看到它就不更新积分（保持当前值不动，
+     * 既不夹边界也不清零），处理完自动清除。 */
+    pid->IntegralHold = 1u;
 }
 
 void PIDInit(PIDInstance *pid, const PID_Init_Config_s *config) {
@@ -137,14 +152,29 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref, float dt_s) {
                           / (pid->Derivative_LPF_RC + dt);
     }
 
-    candidate_i = pid->Iout + pid->ITerm;
-    if (pid->Improve & PID_Integral_Limit) {
-        candidate_i = LimitFloat(candidate_i, -pid->IntegralLimit, pid->IntegralLimit);
+    /* ── 积分保持（冻结）──────────────────────────────────────────────────
+     * 调用方（速度环）在"低速段反馈不可信"时会调 PID_FreezeIntegral() 置位。
+     * 这里让 candidate_i 保持为当前值，既不累积也不被限幅夹到别处。
+     * 处理完立刻清标志，调用方不需要负责复位，因此下一个周期自动恢复正常积分。 */
+    if (pid->IntegralHold != 0u) {
+        pid->IntegralHold = 0u;
+        candidate_i = pid->Iout;
+    } else {
+        candidate_i = pid->Iout + pid->ITerm;
+        if (pid->Improve & PID_Integral_Limit) {
+            candidate_i = LimitFloat(candidate_i, -pid->IntegralLimit, pid->IntegralLimit);
+        }
     }
-    candidate_output = pid->Pout + candidate_i + pid->Dout;
+    /* ★ 前馈必须计入饱和判断 ★
+     * pid->FeedForward 由调用方在每个周期开始前写入（占空比分数，与 Output 同量纲）。
+     * 如果前馈加在 PIDCalculate() 之外（调用方自己 +），那么下面这个抗饱和判据
+     * 就看不到真实的总输出：明明已经饱和了，PID 却以为还有余量，于是继续累积积分，
+     * 等退出饱和时就会"抽"一下。
+     * 注意分母：candidate_output 是"P+I+D"三项之和，加前馈后才是真正写入执行器的量。 */
+    candidate_output = pid->Pout + candidate_i + pid->Dout + pid->FeedForward;
 
     /* ── 抗积分饱和 ────────────────────────────────────────────────────────
-     * 判据改成“输出将要饱和就冻结本次积分”，不再要求误差方向一致。
+     * 判据是"含前馈的总输出将要饱和就冻结本次积分"，不再要求误差方向一致。
      * 原因：误差刚反向、但输出还压在饱和值时（例如堵转刚解除），
      * 原判据会继续累积积分，等误差真正反向后要靠很久才能把积分放掉，
      * 表现为“冲一下再回来”。 */
@@ -153,7 +183,9 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref, float dt_s) {
     }
     pid->Iout = candidate_i;
 
-    pid->Output = pid->Pout + pid->Iout + pid->Dout;
+    /* 输出 = P + I + D + 前馈，然后统一限幅。
+     * 内部保留完整值供遥测/抗饱和使用，最后再钳到 ±MaxOut。 */
+    pid->Output = pid->Pout + pid->Iout + pid->Dout + pid->FeedForward;
 
     if ((pid->Improve & PID_OutputFilter) && pid->Output_LPF_RC > 0.0f) {
         pid->Output = pid->Output * dt / (pid->Output_LPF_RC + dt)

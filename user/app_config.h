@@ -37,9 +37,22 @@
 #define STACK_REMOTE_WORDS 512u
 
 /* ===== 任务优先级（FreeRTOS 数值越大优先级越高，上限 configMAX_PRIORITIES = 56）===== */
-#define PRIO_SAFETY 34u  /* 最高：喂狗必须最准时 */
-#define PRIO_CHASSIS 32u /* 中：队列消费、运动学、速度环 */
-#define PRIO_REMOTE 26u  /* 低：串口字节流解析、投队列 */
+#define PRIO_SAFETY 34u     /* 最高业务任务：喂狗必须最准时 */
+#define PRIO_CHASSIS 32u    /* 速度环：必须在 OLED 之上（见下方说明） */
+#define PRIO_REMOTE 26u     /* 蓝牙字节流解析、投队列 */
+#define PRIO_OLEDPOWER 20u  /* 最低：OLED 刷屏是"有就行"的功能，不能挡路 */
+
+/* ★ 关于 PRIO_OLEDPOWER 必须最低（踩过的坑）★
+ * OLED 任务里有两处会长时间占住 CPU，必须让它们随时能被底盘任务抢占：
+ *   1) StartOLEDPower 启动时调用 ssd1306_Init()，内部是**阻塞式**
+ *      HAL_I2C_Mem_Write，超时参数是 HAL_MAX_DELAY —— OLED 没接好/不响应时会
+ *      一直等 I2C；
+ *   2) 每 100 ms 一次 oled_render()，同样是阻塞 I2C。
+ * 一旦 OLED 任务的优先级高于 Chassis，上面任一处卡住就会把速度环彻底饿死：
+ * 现象是"串口完全没输出、s_vel_tick 停住不动、电机不动"，而 Safety 任务
+ * 因为优先级更高仍在喂狗，所以**看门狗也不会复位**，故障表现得很隐蔽。
+ * 因此 OLED 必须排在 Remote(26) 之下。 */
+
 
 /* ===== 任务名称（调试器里看到的字符串，长度受 configMAX_TASK_NAME_LEN = 16 限制）===== */
 #define NAME_SAFETY "Safety"
@@ -115,9 +128,13 @@
 #define WHEEL_DIAMETER_MM 60.0f
 #define WHEEL_PERIMETER_MM 188.4955592f /* π × 60 */
 
-/* 无同步带：减速箱输出轴直连轮，传动比 1:1。
- * 若以后加同步带，只需把这里改成对应比值（例：电机转 5 圈 = 轮转 1 圈 → 5.0f）。 */
-#define DRIVE_RATIO 1.0f
+/* 编码器到轮轴的总机械减速比（**不是同步带比，是整条传动链的总比**）。
+ * 无同步带、减速箱输出轴直连轮，但编码器装在**电机轴（减速箱之前）**，
+ * 所以从编码器轴到轮轴仍然是 1:30 的总减速。
+ *
+ * 实测依据：手动把轮子转一整圈，s_enc[i].total_count 增加约 1560，
+ * 与 13 PPR × 4 倍频 × 30 = 1560 完全吻合。改这个值前请重新实测。 */
+#define DRIVE_RATIO 30.0f
 
 /* 轮子最大线速度（mm/s）。空载 333 rpm → 188.5 mm/rev × 333/60 = 1046 mm/s。
  * 这个值同时用作“运动学输出的物理上限”，速度环的限幅用它。 */
@@ -134,32 +151,32 @@
 /* 7. 编码器与测速                                                            */
 /*============================================================================*/
 
-/* 编码器：11 PPR 霍尔编码器，装在**电机轴**（减速箱之前）。
+/* 编码器：13 PPR 霍尔编码器，装在**电机轴**（减速箱之前）。
  * STM32 编码器接口按 TI12 双边沿计数 → 4 倍频：
- *   每电机转计数 = 11 × 4 = 44
- *   每轮转计数   = 44 × DRIVE_RATIO = 44   （无同步带）
- * counts/mm = 44 / 188.5 = 0.2335 → 1 个计数 = 4.28 mm 位移
+ *   每电机转计数 = 13 × 4 = 52
+ *   每轮转计数   = 52 × DRIVE_RATIO(30) = **1560**   ← 已用"手转一圈"实测确认
+ * counts/mm = 1560 / 188.5 = 8.276 → 1 个计数 = 0.121 mm 位移
  *
- * ★ 测速方案与量化误差（重要，它决定了速度环为什么只能跑 100 Hz）：
- *   本车 counts/轮转 只有 44，而最高车速 1046 mm/s，因此
- *     - 10 ms 窗口在满速时约 2.5 个计数；
- *     - 1 个计数的量化噪声 = 1 计数 / 窗口时长。
- *   于是速度反馈的噪声地板为：
- *     1 计数 / 10 ms = 100 counts/s ≈ 428 mm/s/... 换算后 = 42.8 mm/s ← 满速的 4%
- *   即：整条速度环的噪声地板是 ±43 mm/s，与车速无关。
- *   这就是为什么：
- *     - 速度环只能跑 100 Hz（窗口再短噪声更大）；
- *     - 0.2 m/s 以下速度反馈基本不可信（噪声占比 >20%），低速段靠 I 项慢慢积分；
- *     - 不要指望高带宽调参，Kp 给到 3 量级就够，往上冲等于拿噪声驱动电机。
- *   想要改善只能换更高线数编码器，或加一级同步带提高 counts/mm。 */
-#define ENCODER_PPR_MOTOR 11.0f
+ * ★ 测速方案与量化误差（这几个数是实车参数决定的，改参数后要重算）：
+ *   满速 1046 mm/s = 5.55 转/秒 = 8657 counts/s，因此 10 ms 窗口里有约 **86 个计数**，
+ *   量化噪声地板是
+ *     1 计数 / 10 ms = 100 counts/s = **12 mm/s**（仅满速的 1%）。
+ *   这个分辨率很好，所以：
+ *     - 速度环跑 100 Hz（10 ms）完全够用，不需要更长窗口；
+ *     - 0.2 m/s 时仍有约 16.6 个计数（±6%），低速也可信；
+ *     - Kp 可以给到 3~5，不必因为噪声而压低带宽。
+ *
+ *   ⚠ 这一段曾经按"11 PPR × DRIVE_RATIO=1 → 44 counts/轮转"写过，那时算出的噪声
+ *     地板是 ±428 mm/s，导致结论完全相反（"低速不可信、Kp 不要超 5"）。
+ *     实测 1560 之后结论翻过来了——**改任何机械/编码器参数都要回来重算这段**。 */
+#define ENCODER_PPR_MOTOR 13.0f
 #define ENCODER_QUADRATURE 4.0f
-#define ENCODER_COUNT_PER_MOTOR_REV (ENCODER_PPR_MOTOR * ENCODER_QUADRATURE)   /* 44 */
-#define ENCODER_COUNT_PER_WHEEL_REV (ENCODER_COUNT_PER_MOTOR_REV * DRIVE_RATIO) /* 44 */
+#define ENCODER_COUNT_PER_MOTOR_REV (ENCODER_PPR_MOTOR * ENCODER_QUADRATURE)   /* 52 */
+#define ENCODER_COUNT_PER_WHEEL_REV (ENCODER_COUNT_PER_MOTOR_REV * DRIVE_RATIO) /* 1560 */
 
 /* counts/s → mm/s 的换算系数：
- *   mm_per_count = WHEEL_PERIMETER_MM / ENCODER_COUNT_PER_WHEEL_REV = 4.2840
- *   所以 1 counts/s = 4.284 mm/s，反之 1 mm/s = 0.2335 counts/s。 */
+ *   mm_per_count = WHEEL_PERIMETER_MM / ENCODER_COUNT_PER_WHEEL_REV = 0.1208
+ *   所以 1 counts/s = 0.1208 mm/s，反之 1 mm/s = 8.276 counts/s。 */
 #define ENCODER_COUNTS_TO_MMPS (WHEEL_PERIMETER_MM * 1000.0f / ENCODER_COUNT_PER_WHEEL_REV)
 #define MMPS_TO_ENCODER_COUNTS (ENCODER_COUNT_PER_WHEEL_REV / (WHEEL_PERIMETER_MM * 1000.0f))
 
@@ -226,7 +243,7 @@
  * （顺序是你实车上认定的位置，标定时请核对，与 CubeMX 标签无关） */
 #define MOTOR_SIGN_DIR_FL (1)
 #define MOTOR_SIGN_PWM_FL (1)
-#define MOTOR_SIGN_ENC_FL (1)
+#define MOTOR_SIGN_ENC_FL (-1)
 #define MOTOR_DEADBAND_FL 1000u
 
 #define MOTOR_SIGN_DIR_FR (1)
@@ -235,8 +252,8 @@
 #define MOTOR_DEADBAND_FR 1000u
 
 #define MOTOR_SIGN_DIR_RL (1)
-#define MOTOR_SIGN_PWM_RL (1)
-#define MOTOR_SIGN_ENC_RL (1)
+#define MOTOR_SIGN_PWM_RL (-1)
+#define MOTOR_SIGN_ENC_RL (-1)
 #define MOTOR_DEADBAND_RL 1000u
 
 #define MOTOR_SIGN_DIR_RR (1)
@@ -251,12 +268,12 @@
  * 支持用编译选项覆盖（-DMOTOR_TEST_MODE=0），这样同一份源码可以同时
  * 编译“标定固件”和“闭环固件”而不用改文件；下面的 #ifndef 保证不会重定义。 */
 #ifndef MOTOR_TEST_MODE
-#define MOTOR_TEST_MODE 1
+#define MOTOR_TEST_MODE 0
 #endif
 
 /* 标定模式下的占空比范围（计数）。占空比 = MOTOR_TEST_DUTY_BASE ±
  * |摇杆| × MOTOR_TEST_DUTY_SPAN / 512。 */
-#define MOTOR_TEST_DUTY_BASE 0
+#define MOTOR_TEST_DUTY_BASE 1
 #define MOTOR_TEST_DUTY_SPAN 3000
 
 /*============================================================================*/
@@ -284,10 +301,23 @@
 /* 输出侧低通（RC，秒）。0 = 不滤波。速度环输出已经比较干净，先不开。 */
 #define VEL_OUTPUT_LPF_RC_S 0.0f
 
-/* 低速段冻结积分的阈值（mm/s）。低于它时速度反馈被量化噪声淹没，
- * 继续积分只会把 I 项喂偏；此时改用前馈 + P 项，并冻结积分。
- * 取 2 倍噪声地板（±43 mm/s）略多。 */
+/* 低速段冻结积分的阈值（mm/s）。低于它时速度环认为车基本没动，
+ * 继续积分只会让 I 项被残余噪声喂偏；此时冻结积分，改用前馈 + P 项。
+ * 取 100 mm/s（约满速的 10%）。 */
 #define VEL_LOWSPEED_FREEZE_MMPS 100.0f
+
+/* ★ 反馈可信性检查：单周期允许的实测速度跳变上限（mm/s²）★
+ *
+ * 编码器被电机换向火花 / PWM 开关瞬态干扰时，会出现"一个周期内从几百跳到
+ * 几百万 mm/s"的坏采样。一阶低通对**脉冲噪声无效**（它只平滑、不剔除），
+ * 这种尖峰会让 PID 瞬间饱和到满占空比并反向猛冲。
+ * 处理办法：把本周期实测值与上一周期比较，若差值超过 本值 × dt_s，
+ * 就判定该采样无效 —— 保持上一次的值，并复位滤波器状态。
+ *
+ * 取值依据：本车牵引力/质量估算的实际加速度上限约 9 m/s²，
+ * 这里取 50 m/s²（= 50000 mm/s²），比物理可能大 5 倍以上，
+ * 因此**正常运行永远不会触发**，只在真的出现坏采样时才拦截。 */
+#define VEL_IMPLAUSIBLE_ACC_MMPS2 50000.0f
 
 /*============================================================================*/
 /* 11. 独立看门狗（IWDG）                                                      */
@@ -304,15 +334,19 @@
  * RLR = 499 → 499 * 8 ms ≈ 4.0 s。
  * 取 4 s 而不是更短：Ozone 单步/断点会长时间停住 CPU，喂狗任务同样停住，
  * 超时太短会在调试时被反复复位。4 s 依然能兜住真正的死锁。 */
-#define IWDG_PRESCALER 6u /* PR[2:0]：6 → 分频 4 * 2^6 = 256 */
-#define IWDG_RELOAD 499u  /* RLR：约 4.0 s @ 32 kHz LSI */
+#define APP_IWDG_PRESCALER 6u /* PR[2:0]：6 → 分频 4 * 2^6 = 256 */
+#define APP_IWDG_RELOAD 499u  /* RLR：约 4.0 s @ 32 kHz LSI */
 
 /* IWDG 键寄存器（IWDG_KR）的魔术值。STM32 的设备头文件只定义了 IWDG_KR_KEY
  * 位域，没有给这几个键值起名字，所以在这里集中定义，避免 .c 里出现裸数字。
- * 取值来自参考手册 RM0090 的 IWDG 章节。 */
-#define IWDG_KEY_UNLOCK 0x5555u /* 解除 PR / RLR 的写保护 */
-#define IWDG_KEY_RELOAD 0xAAAAu /* 重装计数器（等价于 HAL_IWDG_Refresh()）*/
-#define IWDG_KEY_START 0xCCCCu  /* 启动看门狗（启动后无法停止）*/
+ * 取值来自参考手册 RM0090 的 IWDG 章节。
+ *
+ * ⚠ 命名必须带 APP_ 前缀：如果启用了 HAL_IWDG_MODULE_ENABLED，
+ *   stm32f4xx_hal_iwdg.h 里已经定义了 IWDG_KEY_RELOAD 等宏，
+ *   不带前缀会与之重定义冲突（-Wmacro-redefined 警告）。 */
+#define APP_IWDG_KEY_UNLOCK 0x5555u /* 解除 PR / RLR 的写保护 */
+#define APP_IWDG_KEY_RELOAD 0xAAAAu /* 重装计数器（等价于 HAL_IWDG_Refresh()）*/
+#define APP_IWDG_KEY_START 0xCCCCu  /* 启动看门狗（启动后无法停止）*/
 
 /*============================================================================*/
 /* 12. 内存布局常量（CCM RAM 红线）                                            */
@@ -464,12 +498,22 @@ APP_STATIC_ASSERT((MOTOR_DEADBAND_RR < MOTOR_PWM_FULL), "MOTOR_DEADBAND_RR out o
  *   "不丢采样"——采样由 DMA + 中断累加，任务晚一点取均值不影响结果。 */
 #define OLED_REFRESH_DIVIDER 10u
 
-/* 任务栈（字）与优先级。任务用 xTaskCreateStatic 静态创建（不占 FreeRTOS heap），
- * 优先级 35 与 CubeMX 里 OLEDPowerTask 的 osPriorityAboveNormal3 一致：
- * 高于 Remote(26)，低于 Chassis(32)……注意数值越大优先级越高，所以实际是
- * **低于 Chassis(32/Raw=47)、低于 Safety、高于 Remote**，不会抢占速度环。 */
+/* 任务栈（字）与优先级。任务用 xTaskCreateStatic 静态创建（不占 FreeRTOS heap）。
+ *
+ * ★ PRIO_OLEDPOWER 由本节统一规定，是**全系统最低**的优先级。
+ *   原因（踩过的坑）：OLED 任务里有两处会长时间占住 CPU，必须让它们随时能被
+ *   底盘任务抢占：
+ *     1) StartOLEDPower 启动时调用 ssd1306_Init()，内部是**阻塞式**
+ *        HAL_I2C_Mem_Write，超时参数是 HAL_MAX_DELAY —— OLED 没接好/不响应
+ *        时会一直等 I2C；
+ *     2) 每 100 ms 一次 oled_render()，同样是阻塞 I2C。
+ *   一旦 OLED 优先级高于 Chassis，上面任一处卡住就会把速度环彻底饿死：
+ *   现象是"串口完全没输出、s_vel_tick 停住不动、电机不动"，而 Safety 任务
+ *   因为优先级更高仍在喂狗，所以**看门狗也不会复位**，故障表现得非常隐蔽。
+ *
+ *   定义只在下面这一处，数值见第 1 节（PRIO_OLEDPOWER = 20）。
+ *   注意"数值越大优先级越高"：20 低于 Remote(26)，因此 OLED 不会挡住任何任务。 */
 #define STACK_OLEDPOWER_WORDS 768u
-#define PRIO_OLEDPOWER 35u
 #define NAME_OLEDPOWER "OLEDPower"
 
 /* ── 本节自检 ─────────────────────────────────────────────────────────────── */

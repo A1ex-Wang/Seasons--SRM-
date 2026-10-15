@@ -57,10 +57,10 @@ add_executable(${CMAKE_PROJECT_NAME}
         user/app_types.h
         user/debug_uart.c
         user/debug_uart.h
-        " Middlewares/Third_Party/SRM/srm_uart.c"
-        " Middlewares/Third_Party/SRM/srm_remote.h"
-        " Middlewares/Third_Party/SRM/srm_protocol.c"
-        " Middlewares/Third_Party/SRM/srm_remote.c"
+        Middlewares/Third_Party/SRM/srm_uart.c
+        Middlewares/Third_Party/SRM/srm_remote.h
+        Middlewares/Third_Party/SRM/srm_protocol.c
+        Middlewares/Third_Party/SRM/srm_remote.c
         user/control/control_time.c
         user/control/control_time.h
         user/control/controller.c
@@ -99,7 +99,9 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # 注意 ssd1306_conf.h 内部还会 #include "i2c.h"，那个由 Core/Inc 提供。
     ${CMAKE_CURRENT_SOURCE_DIR}/user/ssd1306
     # 上游 SRM v4 协议层头文件（srm_remote.h / srm_protocol.h / srm_uart.h）
-    "${CMAKE_CURRENT_SOURCE_DIR}/ Middlewares/Third_Party/SRM"
+    # ⚠ 注意目录名是 SRM（前面没有空格）。这里原来写成 " Middlewares/..."（带一个
+    #   前导空格）指向不存在的路径，会导致找不到 srm_remote.h 而编译失败。
+    ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/SRM
 )
 
 # Add project symbols (macros)

@@ -69,6 +69,12 @@ motor_cmd_t g_motor_cmd;
 /** @brief 四轮速度反馈的滤波状态（mm/s），初值在 VelCtl_Init() 里清零。 */
 static float s_speed_lpf[WHEEL_COUNT];
 
+/** @brief 上一周期的实测速度（mm/s），用于变化率限幅（剔除坏采样）。 */
+static float s_meas_prev[WHEEL_COUNT];
+
+/** @brief 上一周期发给该轮的目标速度（mm/s），仅供遥测显示用（结构体里的名字是反的）。 */
+static float s_target_mmps[WHEEL_COUNT];
+
 /* 上一周期的车体指令（用于加速度限幅）。单位 mm/s、mrad/s。 */
 static float s_vx_prev = 0.0f;
 static float s_vy_prev = 0.0f;
@@ -167,6 +173,8 @@ void VelCtl_Init(void) {
     for (i = 0; i < (int)WHEEL_COUNT; i++) {
         Encode_Start(&s_enc[i]);
         s_speed_lpf[i] = 0.0f;
+        s_meas_prev[i] = 0.0f;
+        s_target_mmps[i] = 0.0f;
     }
 
     for (i = 0; i < (int)WHEEL_COUNT; i++) {
@@ -330,37 +338,78 @@ static int32_t wheel_loop_step(WheelId_e id, float ref_mmps, float dt_s) {
     float abs_ref;
     float abs_meas;
 
-    /* 先做一阶低通再进 PID：编码器只有 44 counts/轮转，10 ms 窗口下
-     * 量化噪声地板约 ±43 mm/s（见 app_config.h 第 7 节）。
-     * 滤波器不能消除这个地板，但能阻止它被 Kp 直接放大成电机嗡鸣。
-     * s_speed_lpf 同时也是遥测打印用的值，保证“看到的”就是“控制用的”。 */
+    /* ★ 反馈可信性检查（变化率限幅）★
+     *
+     * 目的：编码器偶尔会出现"单周期跳到几百万 mm/s"的坏采样。一阶低通对这种
+     * 脉冲无效（它只平滑、不剔除），尖峰会让 PID 瞬间饱和到满占空比并反向猛冲。
+     *
+     * ★ 这里**必须用"限幅收敛"，绝对不能用"拒绝采样"** —— 本工程踩过这个大坑：
+     *   曾经的写法是"超阈值就把本次采样丢掉、用上一次的值代替"，
+     *   并且把 s_meas_prev 也写成替换后的值。结果是一个**自我维持的死锁**：
+     *     初值 s_meas_prev = 0
+     *     真实速度 = -7900，|−7900 − 0| = 7900 > 500  →  判定"坏采样" → 丢弃
+     *     s_meas_prev 又被写回 0
+     *     → PID 永远看到 meas = 0 → Err 恒定巨大 → 输出饱和 → 轮子狂转
+     *     → 下一周期真实速度还是 −7900 → 继续丢弃 …… 永远不会自愈。
+     *   因为轮子越快、偏离越大、限幅器就越坚定地拒绝，所以它只会一直狂转。
+     *
+     * 正确做法：把它看成"物理上不可能的变化速率"，只限制**变化量**，
+     * 让估计值以每周期 ±jump_limit 的速度平滑逼近真值。这样：
+     *   - 尖峰仍被压制（单周期最多变 jump_limit，不会瞬间饱和）；
+     *   - 但只要变化速率降下来，s_meas_prev 就能追上真值，**不会卡死**。
+     *   jump_limit = 50000 mm/s² × 0.01 s = 500 mm/s/周期
+     *   → 从 0 爬到 8657 只需约 17 个周期（170 ms），完全可接受。
+     *
+     * 注意最后一句：只在真的检测到坏采样时才复位滤波器状态。 */
     raw_mmps = Encode_GetSpeedMmps(&s_enc[id]);
+    {
+        float jump_limit = (float)VEL_IMPLAUSIBLE_ACC_MMPS2 * dt_s;
+        float delta = raw_mmps - s_meas_prev[id];
+
+        if (delta > jump_limit) {
+            raw_mmps = s_meas_prev[id] + jump_limit; /* 限速上升，而不是丢弃 */
+            s_speed_lpf[id] = raw_mmps;              /* 被限幅 → 本次不可信，复位滤波历史 */
+        } else if (delta < -jump_limit) {
+            raw_mmps = s_meas_prev[id] - jump_limit; /* 限速下降 */
+            s_speed_lpf[id] = raw_mmps;
+        }
+    }
+    s_meas_prev[id] = raw_mmps;
+
+    /* 一阶低通：编码器 1560 counts/轮转，10 ms 窗口下量化噪声地板约 ±12 mm/s，
+     * 只有满速的 1%（见 app_config.h 第 7 节）。分辨率已经很好，滤波器的作用
+     * 只是压掉机械抖动带来的高频毛刺，不要为了"更干净"把 RC 调大——
+     * 那只会增加相位滞后、拖累 Kp。 */
     s_speed_lpf[id] = lpf1(s_speed_lpf[id], raw_mmps, VEL_FEEDBACK_LPF_RC_S, dt_s);
     meas_mmps = s_speed_lpf[id];
 
-    /* 低速段保护：目标速度和反馈速度都很小的时候，反馈被量化噪声淹没
-     * （1 个计数 / 10 ms = 43 mm/s 的噪声地板，见 app_config.h 第 7 节）。
-     * 此时把**积分上限收紧到当前积分值**，等于冻结积分累积，
-     * 只用 P 项和前馈——避免 I 项被噪声喂偏导致停止时整车抖动。 */
+    /* 低速段保护：目标速度和反馈速度都很小时，说明车基本没动。
+     * 此时冻结积分累积（PID_FreezeIntegral 只置标志，PIDCalculate 看到后
+     * 保持积分不动、既不累积也不夹边界），只用 P 项和前馈，
+     * 避免 I 项被残余噪声喂偏导致静止时的整车抖动。 */
     abs_ref = fabsf(ref_mmps);
     abs_meas = fabsf(meas_mmps);
     if ((abs_ref < VEL_LOWSPEED_FREEZE_MMPS) && (abs_meas < VEL_LOWSPEED_FREEZE_MMPS)) {
-        float i_now = fabsf(s_pid[id].Iout);
-
-        s_pid[id].IntegralLimit = i_now;
-        duty_frac = PIDCalculate(&s_pid[id], meas_mmps, ref_mmps, dt_s);
-        s_pid[id].IntegralLimit = VEL_INTEGRAL_LIMIT;
+        PID_FreezeIntegral(&s_pid[id]);
     } else {
-        duty_frac = PIDCalculate(&s_pid[id], meas_mmps, ref_mmps, dt_s);
+        s_pid[id].IntegralLimit = VEL_INTEGRAL_LIMIT;
     }
 
-    /* 前馈：按“满占空比 ≈ 空载最高轮速”的斜率直接给出直流工作点，
-     * PI 只负责修模型误差。这一项能显著减小低速段的稳态误差，
-     * 因为低速段 I 项被冻结了。 */
-    duty_frac += VEL_FF_GAIN * ref_mmps;
+    /* 前馈写进结构体（不是在这里自己加），这样 PID 内部的抗饱和能看见它。
+     * 斜率按"满占空比 ≈ 空载最高轮速"给出直流工作点，PI 只修模型误差；
+     * 低速段 I 项被冻结，主要靠这一项维持出力。 */
+    s_pid[id].FeedForward = VEL_FF_GAIN * ref_mmps;
+
+    /* 注意参数顺序：PIDCalculate(pid, measure, ref, dt_s)。
+     * 这是"目标值和实测值"的顺序，不是(pid) 内部字段名 Ref/Measure 的顺序——
+     * 那两个字段名与原义相反，见 controller.h 的警告注释。 */
+    duty_frac = PIDCalculate(&s_pid[id], meas_mmps, ref_mmps, dt_s);
 
     duty_frac = clampf(duty_frac, -1.0f, 1.0f);
     duty_counts = (int32_t)(duty_frac * (float)MOTOR_PWM_FULL);
+
+    /* 遥测用的目标值（controller.h 的 Ref/Measure 名字是反的，单独存一份好读） */
+    s_target_mmps[id] = ref_mmps;
 
     Motor_SetDuty(id, duty_counts);
 
@@ -402,9 +451,18 @@ void VelCtl_Feed(const remote_in_t *cmd, float dt_s) {
         return;
     }
 
-    /* ── 每 1 ms 累积编码器计数（Encode_Update 内部按窗口分频才做除法）── */
-    for (i = 0; i < (int)WHEEL_COUNT; i++) {
-        Encode_Update(&s_enc[i]);
+    /* ── 推进编码器测速窗口 ────────────────────────────────────────────────
+     * ⚠ 本函数（以及这里的 Encode_Update）是**每 VEL_LOOP_PERIOD_MS = 10 ms**
+     *   才被 Chassis 任务调用一次，不是 1 ms！所以必须把真实的经过时间
+     *   dt_s 换算成毫秒传下去；如果让 Encode_Update 自己按"调用一次=1 ms"累加，
+     *   窗口会变成实际的 10 倍长，算出的速度也跟着放大 10 倍
+     *   （后果：PID 以为轮子飞转，输出饱和、电机狂转）。 */
+    {
+        uint32_t dt_ms = (uint32_t)(dt_s * 1000.0f + 0.5f);
+
+        for (i = 0; i < (int)WHEEL_COUNT; i++) {
+            Encode_Update(&s_enc[i], dt_ms);
+        }
     }
 
     /* ── 链路检查放在最前面，优先级最高 ──
@@ -463,4 +521,11 @@ float VelCtl_GetWheelSpeedMmps(WheelId_e id) {
 int32_t VelCtl_GetWheelDuty(WheelId_e id) {
     if ((int)id >= (int)WHEEL_COUNT) return 0;
     return (int32_t)s_cmd_snapshot.duty[id];
+}
+
+float VelCtl_GetWheelTargetMmps(WheelId_e id) {
+    if ((int)id >= (int)WHEEL_COUNT) return 0.0f;
+    /* 专门存一份目标值，避免去读 PIDInstance 里那个名字是反的 Ref 字段
+     * （见 controller.h 的警告注释）。 */
+    return s_target_mmps[id];
 }

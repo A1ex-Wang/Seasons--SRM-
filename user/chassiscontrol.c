@@ -39,6 +39,12 @@ static uint32_t s_vel_tick = 0u;
 /* 上一轮速度环执行的 tick，用于算真实的 dt_s。 */
 static TickType_t s_vel_last_tick = 0u;
 
+/* 速度环是否已经执行过第一次。
+ * ⚠ 不能拿 s_vel_last_tick == 0 当"还没执行过"的哨兵：tick 0 是合法值
+ * （调度器刚启动时第一次读 tick 完全可能为 0），一旦命中就会一直走"标称周期"
+ * 分支，直到 tick 绕回 0（约 49.7 天）。所以用一个独立标志。 */
+static uint8_t s_vel_started = 0u;
+
 void Chassis_TakeLatest(remote_in_t *out) {
     if (out != NULL) {
         *out = s_last_cmd;
@@ -79,9 +85,10 @@ static void vel_loop_tick(void) {
     TickType_t now = xTaskGetTickCount();
     float dt_s;
 
-    if (s_vel_last_tick == 0u) {
+    if (s_vel_started == 0u) {
         /* 第一次调用：还没有上一次的时刻，用标称周期。 */
         dt_s = (float)VEL_LOOP_PERIOD_MS / 1000.0f;
+        s_vel_started = 1u;
     } else {
         dt_s = (float)(now - s_vel_last_tick) / (float)APP_TICK_RATE_HZ;
         if (dt_s <= 0.0f) {

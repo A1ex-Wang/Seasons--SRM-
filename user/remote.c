@@ -31,6 +31,32 @@
 
 #include "srm_remote.h" /* 上游协议层（Middlewares/Third_Party/SRM） */
 
+/*============================================================================*/
+/* ★ 调试开关（必须放在所有 #if 之前！）★                                      */
+/*============================================================================*/
+/*
+ * DEBUG_NO_REMOTE = 1：无蓝牙模块时的调试旁路。
+ *   - 跳过 Remote_ProtocolInit()，避开 upstream 里
+ *       configASSERT(init_status == HAL_OK)
+ *     （本工程的 configASSERT 是 {taskDISABLE_INTERRUPTS(); for(;;);}，
+ *      会关中断并永久卡死 Remote 任务 → 调度器停摆 → Chassis 任务不执行）
+ *   - 整段跳过"失联兜底投帧"：没有蓝牙时 g_remote.last_control_ms 恒为 0，
+ *     上电满 600 ms 后 remote_link_is_online() 由 1 翻 0 会投出一帧全零的
+ *     remote_in_t，把 Ozone 里手写的 s_last_cmd.online / ly 覆盖掉
+ *     （现象：改完值能保持一会儿，然后自己变回 0）。
+ *   于是 s_last_cmd 完全归调试器掌控。
+ *
+ * ⚠ 正常固件（要蓝牙遥控）必须为 0。可用 -DDEBUG_NO_REMOTE=0 覆盖。
+ *
+ * ⚠⚠ 这个 #define 必须出现在文件里**所有 #if (DEBUG_NO_REMOTE ...) 之前**。
+ *   预处理是自上而下的：如果定义在守卫之后，守卫处该宏还是"未定义"，
+ *   而在 #if 里未定义标识符按 0 处理，于是 (0 == 0) 恒真、
+ *   守卫完全失效（函数照样被编译进去并触发 -Wunused-function）。
+ *   这个坑本文件踩过一次，改动时不要把这段往下挪。 */
+#ifndef DEBUG_NO_REMOTE
+#define DEBUG_NO_REMOTE 1
+#endif
+
 #include "chassiscontrol.h"
 #include "debug_uart.h"
 #include "safety.h"
@@ -41,7 +67,10 @@
 /*============================================================================*/
 
 /* 队列缓冲区与静态队列控制块。必须是文件作用域 static（.bss / SRAM1），
- * 这样队列在程序生命周期内一直有效，且完全不经过 FreeRTOS heap。 */
+ * 这样队列在程序生命周期内一直有效，且完全不经过 FreeRTOS heap。
+ *
+ * 注意：**调试旁路下也要保留这两个缓冲**——DEBUG_NO_REMOTE=1 只是没人往里投帧，
+ * App_Init() 仍然会创建队列（chassis 侧也照常取），所以它们并非"未使用"。 */
 static uint8_t s_queue_storage[Q_REMOTE_LEN * sizeof(remote_in_t)];
 static StaticQueue_t s_queue_cb;
 
@@ -74,7 +103,10 @@ static srm_pro_control_state_t g_last_pro;
 static volatile TickType_t g_last_frame_tick; /**< 最近一帧到达时的 tick，用于时间戳 */
 static volatile uint8_t g_frame_valid;        /**< 本轮 SRM_Remote_Poll() 是否产生了新状态 */
 static volatile uint8_t g_frame_is_pro;       /**< 1 = 数据源是 PRO_CONTROL，0 = CONTROL */
-static uint32_t g_frames_dropped;             /**< 因队列满而被丢弃的新帧计数（诊断用） */
+/** @brief 因队列满而被丢弃的新帧计数（诊断用），仅生产分支使用。 */
+#if (DEBUG_NO_REMOTE == 0)
+static uint32_t g_frames_dropped;
+#endif
 
 /*============================================================================*/
 /* 板级回调：只能做「拷贝字段 + 置标志」                                       */
@@ -160,12 +192,17 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
   * 这里只是复用该判据做显示，没有新建任何计时器（约束 7）。
   */
 //online函数在线置1，超时置0
+#if (DEBUG_NO_REMOTE == 0)
 static uint8_t remote_link_is_online(void) {
     return ((uint32_t)(xTaskGetTickCount() - (TickType_t)g_remote.last_control_ms)
             <= (uint32_t)REMOTE_TIMEOUT_MS)
                ? 1u
                : 0u;
 }
+
+/* 帧构建与投递只被生产分支使用；调试旁路（DEBUG_NO_REMOTE=1）下整体不编译，
+ * 既避免"定义了但没用"的编译告警，也保证调试期绝对不可能投出任何帧。
+ * 同一个 #if 块覆盖：remote_link_is_online / build_remote_in / post_current_frame。 */
 
 /** @brief 按当前数据源把快照转成 remote_in_t。 */
 static void build_remote_in(remote_in_t *out) {
@@ -215,6 +252,8 @@ static void post_current_frame(void) {
         g_frames_dropped++;
     }
 }
+
+#endif /* DEBUG_NO_REMOTE == 0 */
 
 /*============================================================================*/
 /* 初始化                                                                      */
@@ -278,20 +317,73 @@ BaseType_t Remote_ProtocolInit(void) {
 /* 任务：Remote                                                                */
 /*============================================================================*/
 
+/* ★ 调试开关：没有蓝牙模块时用 Ozone 直接改 s_last_cmd 调底盘 ★
+ *
+ * 为什么需要它（这是实机调试踩过的坑，务必理解）：
+ *   Remote_ProtocolInit() 里有一句
+ *       configASSERT(g_remote.init_status == HAL_OK);
+ *   而本工程的 configASSERT 定义是（见 Core/Inc/FreeRTOSConfig.h）
+ *       #define configASSERT(x) if ((x) == 0) {taskDISABLE_INTERRUPTS(); for(;;);}
+ *   —— **它会关中断并死循环**。
+ *
+ *   于是"没接蓝牙模块"这个纯调试场景会变成整机瘫痪：
+ *     没接蓝牙 → BT_UART_HANDLE.hdmarx == NULL
+ *     → 上游 srm_uart_init() 参数检查失败返回 HAL_ERROR
+ *     → configASSERT 触发：关中断 + Remote 任务（优先级 26）永久卡死
+ *     → SysTick 被屏蔽 → 调度器停摆
+ *     → **Chassis 任务（优先级 32）永远得不到执行**
+ *     → Motor_Init() 没跑、四路 PWM 没启动、s_last_cmd 没有任何人读
+ *     → 现象：在 Ozone 里怎么改 s_last_cmd.ly / online，电机都不转。
+ *
+ * DEBUG_NO_REMOTE = 1 时：**跳过 Remote_ProtocolInit()**，但不删任务。
+ *   任务照常创建、照常 1 ms 周期跑，只是不解析协议；
+ *   由于 g_remote.init_status 保持为 0（≠ HAL_OK），SRM_Remote_Poll() 会
+ *   在第一行就 return（上游有此保护），所以不会有任何帧被投递，
+ *   **s_last_cmd 永远归你掌控**，可以放心用 Ozone 写它来测底盘。
+ *
+ * ⚠ 正常固件（要蓝牙遥控）必须保持 0，否则遥控链路完全不工作。
+ *   可以用编译选项覆盖：-DDEBUG_NO_REMOTE=0。
+ *
+ * ⚠ 宏定义已移到文件顶部（所有 #if 之前），见上面第 4 节的说明。
+ *   这里**不要**再写 #define，否则又是"定义晚于使用"的坑。 */
+
 void StartRemoteTask(void *argument) {
     TickType_t last_wake;
-    uint8_t link_online;
+#if (DEBUG_NO_REMOTE == 0)
+    uint8_t link_online;   /* 仅在解析协议时需要记录上一周期在线状态 */
+#endif
 
     (void)argument;
 
+#if (DEBUG_NO_REMOTE == 0)
     if (Remote_ProtocolInit() != pdPASS) {
         (void)printf("[remote] SRM_Remote_Init FAILED: check USART2 RX DMA = Circular\r\n");
     }
+#else
+    /* 调试旁路：不调用 Remote_ProtocolInit()。
+     * g_remote 全零 → init_status == 0(≠HAL_OK) → 下面循环里的
+     * SRM_Remote_Poll() 会立刻返回，等价于"遥控链路不存在"，
+     * 因此 s_last_cmd 不会被任何人写入。 */
+    (void)printf("[remote] DEBUG_NO_REMOTE=1: protocol init skipped, Ozone drives s_last_cmd\r\n");
+#endif
 
+#if (DEBUG_NO_REMOTE == 0)
     link_online = remote_link_is_online();
+#endif
     last_wake = xTaskGetTickCount();
 
     for (;;) {
+#if (DEBUG_NO_REMOTE != 0)
+        /* ── 调试旁路：不碰链路状态、不投任何帧 ──────────────────────────────
+         * 只跳过 Remote_ProtocolInit() 是不够的：没有蓝牙时
+         * g_remote.last_control_ms 恒为 0，上电满 600 ms 后
+         * remote_link_is_online() 会从 1 翻到 0，于是 now_online != link_online
+         * 成立，**仍然会投出一帧全零的 remote_in_t**，把 Ozone 里手动写的
+         * s_last_cmd.ly / s_last_cmd.online 覆盖成 0。
+         * （现象：改完值能保持一会儿，然后自己变回 0。）
+         * 所以这里干脆什么都不做，让 s_last_cmd 完全归调试器掌控。
+         * 生产固件（DEBUG_NO_REMOTE=0）走下面的正常逻辑，行为一字不变。 */
+#else
         uint8_t now_online;
         uint8_t need_post;
 
@@ -303,7 +395,7 @@ void StartRemoteTask(void *argument) {
         now_online = remote_link_is_online();
 
         /* 2) 什么时候投队列：
-         *    a) 上游产生了新状态（真实帧，或超时那一刻的全零填充帧）这里由g_frame_valid表征；
+         *    a) 上游产生了新状态（真实帧，或超时那一刻的全零填充帧）；
          *    b) online 状态发生翻转（1→0 显示 LOST，0→1 恢复显示 ON）。
          *    b) 是必需的：上游 apply_safe() 只在超时那一刻回调一次，之后
          *    control_active 被清零、不再回调，所以“失联”这件事只有一次投递机会；
@@ -315,6 +407,7 @@ void StartRemoteTask(void *argument) {
             post_current_frame();
         }
         link_online = now_online;
+#endif /* DEBUG_NO_REMOTE */
 
         /* 3) 固定周期节拍。用 vTaskDelayUntil 而不是 osDelay/HAL_Delay */
         vTaskDelayUntil(&last_wake, (TickType_t)pdMS_TO_TICKS(REMOTE_PERIOD_MS));
@@ -378,12 +471,12 @@ void App_Init(void) {
                             s_stack_chassis,
                             &s_tcb_chassis);
 
-    /* Remote 任务在本任务体内调用 Remote_ProtocolInit()，也就是说
-     * USART2 的 DMA 在调度器启动之后才真正开始接收。
-     * 这是刻意的：SRM_Remote_Init() 内部会调用 HAL_UART_Receive_DMA()，
-     * 放在调度器之前做也没有问题，但把“协议初始化”收敛到它自己的任务里，
-     * 可以让初始化失败（init_status != HAL_OK）通过 configASSERT 明确暴露，
-     * 并且 main.c 只需要插入一行 App_Init()。 */
+    /* ── 第 2.5 步：遥控任务（始终创建）─────────────────────────────────────
+     *
+     * 注意：任务**始终创建**，被 DEBUG_NO_REMOTE 屏蔽的是它内部调用的
+     * Remote_ProtocolInit()，而不是任务本身。原因见 StartRemoteTask() 里的说明：
+     * 只要不调用那个初始化入口，就不会触发 configASSERT 把整机卡死，
+     * 同时又保留了任务存在，避免"任务被删掉导致某些路径永不执行"的隐式副作用。 */
     (void)xTaskCreateStatic(StartRemoteTask,
                             NAME_REMOTE,
                             (uint32_t)STACK_REMOTE_WORDS,

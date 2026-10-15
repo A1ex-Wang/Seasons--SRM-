@@ -39,6 +39,18 @@ float VelCtl_GetWheelSpeedMmps(WheelId_e id);
   */
 int32_t VelCtl_GetWheelDuty(WheelId_e id);
 
+/**
+  * @brief 读某一轮最近一周期发给它的目标速度（mm/s，前进为正）。
+  *
+  * ⚠ 想看"目标 vs 实测"时用这个 + VelCtl_GetWheelSpeedMmps()，
+  *   **不要**去读 PIDInstance 里的 Ref/Measure —— 那两个字段名与实际语义相反
+  *   （`Ref` 装的是实测值、`Measure` 装的是目标值），见 controller.h 的警告。
+  *
+  * @param id 轮标识
+  * @return 该轮目标线速度，单位 mm/s
+  */
+float VelCtl_GetWheelTargetMmps(WheelId_e id);
+
 #ifdef __cplusplus
 }
 #endif

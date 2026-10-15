@@ -3,17 +3,26 @@
   * @file    encode.c
   * @brief   四路增量编码器接口的实现（多实例 + 定窗口测速）。
   *
-  * 调用约定：Encode_Update() 每 1 ms 调用一次（由 Chassis 任务调用），
-  *           每 window_ms（默认 10 ms）更新一次速度。
+  * 调用约定：Encode_Update(enc, dt_ms) 由速度环调用，频率是
+  *           **每 VEL_LOOP_PERIOD_MS = 10 ms 一次**（不是 1 ms！），
+  *           并且必须把真实的经过毫秒数 dt_ms 传进来。
+  *
+  * ★ 为什么 dt_ms 必须是参数（本工程踩过的坑）：
+  *   原来这里写的是 enc->elapsed_ms += 1，即"调用一次就算 1 ms"。
+  *   但调用方实际是 10 ms 才调一次，于是编码器以为过了 10 ms、
+  *   实际过了 100 ms —— 窗口时长变成 10 倍，算出的速度也**放大 10 倍**。
+  *   后果：PID 拿到的实测速度比真实值大一个数量级，误判后输出饱和到
+  *   满占空比、电机狂转。而 total_count（位置）不受影响，所以当时
+  *   "total_count 正常、speed 异常"看起来很像编码器硬件问题，其实不是。
   *
   * ★ 关于 16 位计数器回绕：
   *   TIM1/TIM3/TIM4 的计数器是 16 位，编码器正转越过 0xFFFF 会回到 0，
   *   反转越过 0 会回到 0xFFFF。这里用 (int16_t)(now - last) 做差，
   *   利用二进制补码减法自动得到正确的有符号增量，**前提是两次读取之间
   *   计数变化不超过 ±32767**。
-  *   本车满速 1046 mm/s、44 counts/轮转、1 ms 读取周期：
-  *     满速计数率 = 1046/188.5 × 44 = 244 counts/s → 每毫秒仅 0.24 个计数，
-  *     距离 ±32767 有 5 个数量级的余量，绝对安全。
+  *   本车满速 1046 mm/s、1560 counts/轮转、1 ms 读取周期：
+  *     满速计数率 = 1046/188.5 × 1560 = 8657 counts/s → 每毫秒仅 8.7 个计数，
+  *     距离 ±32767 有 3 个数量级的余量，绝对安全。
   *   （TIM2 是 32 位计数器，更宽松，但用同样的写法也正确。）
   ******************************************************************************
   */
@@ -65,7 +74,7 @@ void Encode_Reset(Encode_t *enc) {
     enc->elapsed_ms = 0;
 }
 
-void Encode_Update(Encode_t *enc) {
+void Encode_Update(Encode_t *enc, uint32_t dt_ms) {
     uint16_t now_raw;
     int32_t delta;
 
@@ -84,15 +93,22 @@ void Encode_Update(Encode_t *enc) {
         enc->window_count += signed_delta;
     }
 
-    /* ── 2) 窗口计时；未到窗口末尾直接返回，不做除法 ── */
-    enc->elapsed_ms += 1;
+    /* ── 2) 窗口计时；未到窗口末尾直接返回，不做除法 ──
+     * ⚠ 用调用方传入的 dt_ms，**绝不能写死 += 1**。
+     *   本工程调用频率是 10 ms 一次（不是 1 ms），写死 +1 会让窗口变成
+     *   实际的 10 倍长，算出来的速度也就放大 10 倍。 */
+    if (dt_ms == 0u) {
+        dt_ms = 1u; /* 兜底：dt 为 0 时按 1 ms 记，避免窗口永远不结束 */
+    }
+    enc->elapsed_ms += (int32_t)dt_ms;
     if ((uint32_t)enc->elapsed_ms < enc->window_ms) {
         return;
     }
 
     /* ── 3) 窗口结束：counts/s = 窗口计数 × 1000 / 窗口毫秒 ──
      * 先乘 1000 再除，避免整数除法把低速段全部截断成 0。
-     * 窗口计数满速时约 2~3，乘 1000 后仍在 int32 范围内，不会溢出。 */
+     * 高分辨率编码器（1560 counts/轮转）满速时窗口计数约 86，
+     * 乘 1000 后仍在 int32 范围内，不会溢出。 */
     enc->speed_counts_s = (enc->window_count * 1000) / (int32_t)enc->window_ms;
 
     enc->window_count = 0;
@@ -109,7 +125,7 @@ int32_t Encode_GetSpeedCountsPerSec(const Encode_t *enc) {
 
 float Encode_GetSpeedMmps(const Encode_t *enc) {
     if (enc == NULL) return 0.0f;
-    /* counts/s → mm/s：1 counting/s 对应 4.284 mm/s（见 app_config.h 第 7 节）。 */
+    /* counts/s → mm/s：1 counts/s 对应 0.1208 mm/s（见 app_config.h 第 7 节）。 */
     return (float)enc->speed_counts_s * ENCODER_COUNTS_TO_MMPS;
 }
 
