@@ -51,6 +51,45 @@ int32_t VelCtl_GetWheelDuty(WheelId_e id);
   */
 float VelCtl_GetWheelTargetMmps(WheelId_e id);
 
+/*============================================================================*/
+/* 遥测接口（只读，调试用，不参与控制）                                        */
+/*============================================================================*/
+/*
+ * ★ 为什么要有这组函数 ★
+ *
+ * Ozone 在 watch 里写 `s_enc[2].speed_mmps` 时，会按**它自己缓存的**数组元素
+ * 步长算地址、按**它自己缓存的**结构体布局算字段偏移。本工程反复改过 Encode_t
+ * 的布局，一旦调试信息与固件不同步，就会算出错位地址、显示物理不可能的读数。
+ *
+ * 下面这组函数**参数是编译期常量、返回标量**，Ozone 直接写函数名求值，
+ * 不经过数组下标计算，不受调试信息缓存影响。
+ *
+ * ★ 函数 ↔ 变量 对照（M3 = RL = 索引 2）
+ *   VelCtl_TelemTargetRL() ↔ s_target_mmps[2]      （目标 = 运动学输出）
+ *   VelCtl_TelemSpeedRL()  ↔ s_enc[2].speed_mmps   （实测 = PID 的 measure）
+ *   VelCtl_TelemDeltaRL()  ↔ s_enc[2].last_delta   （本周期计数增量）
+ *   VelCtl_TelemCountRL()  ↔ s_enc[2].total_count  （累计位置）
+ *   VelCtl_TelemDutyRL()   ↔ s_cmd_snapshot.duty[2]（写入的带符号占空比）
+ */
+
+/** @brief 车身前进指令 vy [mm/s]（>0 = 前进）。 */
+float VelCtl_TelemCmdVy(void);
+
+/** @brief RL 轮（M3）目标轮速 [mm/s]，正数 = 该轮物理前进。 */
+float VelCtl_TelemTargetRL(void);
+
+/** @brief RL 轮（M3）实测轮速 [mm/s]，与目标值同量纲、同符号约定。 */
+float VelCtl_TelemSpeedRL(void);
+
+/** @brief RL 轮（M3）本周期有符号计数增量（满速 ±87）。 */
+int32_t VelCtl_TelemDeltaRL(void);
+
+/** @brief RL 轮（M3）累计位置计数，用来判断"真在转"还是"数错了"。 */
+int32_t VelCtl_TelemCountRL(void);
+
+/** @brief RL 轮（M3）当前带符号占空比（PWM 计数，满量程 8400）。 */
+int32_t VelCtl_TelemDutyRL(void);
+
 #ifdef __cplusplus
 }
 #endif

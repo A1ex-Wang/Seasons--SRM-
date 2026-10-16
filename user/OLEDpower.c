@@ -104,9 +104,17 @@ SemaphoreHandle_t g_i2c1_mutex; /* I2C1 总线互斥锁，定义见 OLEDpower.h 
  *      （见 app_types.h 里对 configSUPPORT_STATIC_ALLOCATION 的断言说明）。
  *   2) 静态创建不会失败、不需要在调度器启动前屏蔽中断去分配内存。
  * 三个变量必须放在文件作用域：任务永不退出，栈的生命周期必须等于程序。 */
-static StaticTask_t s_oled_tcb;                         /* 任务控制块 */
-static StackType_t s_oled_stack[STACK_OLEDPOWER_WORDS]; /* 任务栈 */
-static TaskHandle_t s_oled_task;                        /* 句柄，仅用于调试观察 */
+/* ★★ 这里曾经有 s_oled_tcb / s_oled_stack / s_oled_task 三个静态缓冲，已全部删除 ★★
+ *
+ * Robo.ioc 的 FREERTOS.Tasks01 里 OLEDPowerTask 是 Dynamic，MX_FREERTOS_Init()
+ * 已经用 osThreadNew 创建过一次。本文件曾经再用 xTaskCreateStatic 建第二次，
+ * 于是**两个 OLED 任务实例同时在跑**，而它们共用同一个 I2C1 与同一个
+ * g_i2c1_mutex：两个实例各建一次互斥锁（第二次覆盖全局句柄）、刷屏互相打断
+ * → 屏幕撕裂、I2C 报错，并且白吃一份 CPU（每次刷屏约 25 ms 阻塞）。
+ *
+ * 这和 Chassis / Safety / Remote 是同一个 bug（详见 user/remote.c 的 App_Init()
+ * 注释）。现在统一交给 CubeMX 创建，优先级在任务体开头用 vTaskPrioritySet()
+ * 强制成 app_config.h 的约定值。 */
 
 /* 一阶低通的内部状态。只有 OLEDPower 任务会碰，不需要 volatile。 */
 static float s_filtered_v;  /**< 电压低通状态 */
@@ -543,20 +551,22 @@ void OLEDPower_Init(void)
         s_zero_offset_v = raw_to_volts(sum_i / POWER_ZERO_CAL_SAMPLES);
     }
 
-    /* ── 第 3 步：创建 OLEDPower 任务（静态分配）─────────────────────────────
-     * 用 xTaskCreateStatic 而不是 CubeMX 的 osThreadNew：
-     *   - 不占 FreeRTOS heap（本工程硬性约定）；
-     *   - 创建阶段不可能失败，不需要在调度器启动前屏蔽中断；
-     *   - 栈与 TCB 都是本文件的文件作用域对象，生命周期 = 程序。
-     * 任务句柄存下来只为调试观察（Ozone 的表达式窗口里能直接看到它）。 */
-    s_oled_task = xTaskCreateStatic(StartOLEDPower,
-                                    NAME_OLEDPOWER,
-                                    (uint32_t)STACK_OLEDPOWER_WORDS,
-                                    NULL,
-                                    (UBaseType_t)PRIO_OLEDPOWER,
-                                    s_oled_stack,
-                                    &s_oled_tcb);
-    configASSERT(s_oled_task != NULL);
+    /* ── 第 3 步：OLEDPower 任务**不在这里创建** ─────────────────────────────
+     *
+     * 由 CubeMX 的 MX_FREERTOS_Init() 创建（Core/Src/freertos.c 的
+     * osThreadNew(StartOLEDPower, ...)，参数取自 Robo.ioc 的 FREERTOS.Tasks01）。
+     *
+     * ★ 这里绝对不能再建第二次 ★
+     * 曾经用 xTaskCreateStatic 建过第二次，于是两个 OLED 任务实例同时在跑，
+     * 而它们共用同一个 I2C1 与同一个 g_i2c1_mutex：两个实例各执行一次
+     * xSemaphoreCreateMutex()（后者覆盖全局句柄）、刷屏互相打断 →
+     * 屏幕撕裂、I2C 报错，并且白吃一份 CPU（每次刷屏约 25 ms 阻塞）。
+     * 这和 Chassis / Safety / Remote 是同一个 bug，详见 remote.c 的 App_Init()。
+     *
+     * 优先级不在创建时指定，而是在任务体开头用
+     * vTaskPrioritySet(NULL, PRIO_OLEDPOWER) 强制成 app_config.h 的约定值，
+     * 这样 Robo.ioc 里的数字怎么填都不会破坏
+     * "OLED 必须低于 Remote/Chassis" 的次序要求（见 app_config.h:45-54）。 */
 }
 
 /*============================================================================*/
@@ -581,14 +591,23 @@ void StartOLEDPower(void *argument)
 
     (void)argument;
 
+    /* ── 第 0 步：★把优先级强制成 app_config.h 的约定值★ ────────────────────
+     * 本任务由 CubeMX 创建（osThreadNew），优先级取自 Robo.ioc（那里是 35），
+     * 而本工程的约定值是 PRIO_OLEDPOWER（20），并且 app_config.h:45-54 明确要求
+     * **OLED 必须低于 Remote(26) 与 Chassis** —— 因为下面第 2 步的 ssd1306_Init()
+     * 和每 100 ms 一次的刷屏都是**阻塞式** HAL_I2C_Mem_Write（超时 HAL_MAX_DELAY）。
+     * 一旦它的优先级高于速度环，OLED 没接好时就会把速度环彻底饿死，
+     * 现象是"串口没输出、s_vel_tick 停住、电机不动"，而 Safety 仍在喂狗、
+     * 看门狗也不会复位，故障非常隐蔽。
+     * 用 vTaskPrioritySet 覆盖，让 app_config.h 成为唯一真相来源。
+     * ⚠ 必须放在阻塞式 I2C 之前，否则还没降下来就被自己卡住。 */
+    (void)vTaskPrioritySet(NULL, (UBaseType_t)PRIO_OLEDPOWER);
+
     /* ── 第 1 步：创建 I2C1 总线互斥锁 ──────────────────────────────────────
-     * 本任务由 OLEDPower_Init() 用 xTaskCreateStatic 静态创建（不是 CubeMX 的
-     * osThreadNew 动态创建），所以锁是模块里唯一一处动态分配的内核对象。
-     *
-     * 本函数按设计是在调度器启动**之前**调用的（任务排在就绪列表里，等
-     * osKernelStart 才真正开始跑），此时创建内核对象必须屏蔽中断，否则中断里
-     * 若发生内存分配会破坏 heap_4 的空闲链表。用 xTaskGetSchedulerState()
-     * 把"启动前"和"启动后"两种情形都覆盖掉，这样以后有人把它挪到别处也不会错。 */
+     * 本任务由 CubeMX 的 MX_FREERTOS_Init() 创建（Core/Src/freertos.c 的
+     * osThreadNew），此时调度器已经启动，所以走 else 分支；
+     * xTaskGetSchedulerState() 的判断保留下来，是为了以后有人把它挪到
+     * 调度器启动之前调用时也不会破坏 heap_4 的空闲链表。 */
     if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
         taskENTER_CRITICAL();
         g_i2c1_mutex = xSemaphoreCreateMutex();

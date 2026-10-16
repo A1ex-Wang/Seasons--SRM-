@@ -36,14 +36,11 @@ static remote_in_t s_last_cmd;
 /* 速度环节拍计数（1 ms 累加，达到 VEL_LOOP_PERIOD_MS 触发一次）。 */
 static uint32_t s_vel_tick = 0u;
 
-/* 上一轮速度环执行的 tick，用于算真实的 dt_s。 */
-static TickType_t s_vel_last_tick = 0u;
-
-/* 速度环是否已经执行过第一次。
- * ⚠ 不能拿 s_vel_last_tick == 0 当"还没执行过"的哨兵：tick 0 是合法值
- * （调度器刚启动时第一次读 tick 完全可能为 0），一旦命中就会一直走"标称周期"
- * 分支，直到 tick 绕回 0（约 49.7 天）。所以用一个独立标志。 */
-static uint8_t s_vel_started = 0u;
+/* 注：这里曾经有 s_vel_last_tick / s_vel_started，用来把"上一轮速度环的 tick"
+ * 记下来算真实 dt_s。已删除 —— 现在 dt_s 直接用固定标称周期
+ * （VEL_LOOP_PERIOD_MS / 1000），理由见 vel_loop_tick() 的注释：
+ * 测速与 PID 用同一个常数 dt，时间维度上不再有任何变量，
+ * 也就不存在"dt 掉到 1 ms 导致速度放大 10 倍"这类故障。 */
 
 void Chassis_TakeLatest(remote_in_t *out) {
     if (out != NULL) {
@@ -80,25 +77,56 @@ static void print_wheel_line(void) {
                  (long)VelCtl_GetWheelDuty(WHEEL_RR));
 }
 
-/** @brief 执行一次速度环，并用 FreeRTOS tick 算出真实的 dt_s（单位：秒）。 */
+/**
+  * @brief 打印 M3（RL）轮的编码器诊断值（第 3 行）。
+  *
+  * ★ 为什么单独加这一行 ★
+  *   Ozone 的 watch 在数组下标上可能用**过期的步长**算地址（本工程改过
+  *   Encode_t 的布局），从而显示物理不可能的读数。串口打印走的是真实的
+  *   取值函数，**不受调试器符号缓存影响**，所以调参阶段以这一行为准。
+  *
+  * 判读方法（ly 从小往大推）：
+  *   - DELTA：本周期（10 ms）的有符号计数增量。
+  *     满速 = 1046 mm/s → 约 87 个计数/周期；ly=64（112 mm/s）→ 约 9 个。
+  *     若出现几百几千 → 编码器计数被干扰，测速不可信。
+  *   - COUNT：累计位置。正常单向转动时**单调递增**；来回跳 = 真在正反转。
+  *   - TGT ：该轮目标轮速（mm/s），正数 = 物理前进。
+  *   - DUTY：写入的比较寄存器值（带符号，满量程 8400）。
+  *
+  * 全部用整数打印：printf 里用 %f 会链入完整的软浮点格式化代码，
+  * 在 F407 上要多吃好几 KB Flash，这里没必要。
+  */
+static void print_enc_line(void) {
+    (void)printf("RL VY=%5ld TGT=%5ld SPD=%6ld DELTA=%6ld CNT=%8ld DUTY=%5ld\r\n",
+                 (long)VelCtl_TelemCmdVy(),
+                 (long)VelCtl_TelemTargetRL(),
+                 (long)VelCtl_TelemSpeedRL(),
+                 (long)VelCtl_TelemDeltaRL(),
+                 (long)VelCtl_TelemCountRL(),
+                 (long)VelCtl_TelemDutyRL());
+}
+
+/**
+  * @brief 执行一次速度环。
+  *
+  * ★ dt_s 用固定标称周期（VEL_LOOP_PERIOD_MS / 1000 = 0.01 s）★
+  *
+  * 为什么不再测量：本工程的节拍本来就是 FreeRTOS tick 驱动的 —— Chassis 任务
+  * 每 tick（1 ms）跑一次，每 VEL_LOOP_PERIOD_MS 个 tick 调一次速度环，
+  * 所以真实周期稳定在 10 ms。用固定常数有三个好处：
+  *
+  *   1) **测速与 PID 用的是同一个 dt**，两者不可能不一致（这是本工程反复
+  *      出问题的地方：速度按 A 算、积分按 B 算）；
+  *   2) 时间维度上不再有任何变量，也就不存在"dt 掉到 1 ms 导致速度放大 10 倍"
+  *      这种故障（本工程实测出现过 0.001 s、甚至 23 µs 的 dt）；
+  *   3) 与参考项目 D:\STM32\PID_Freertos 的做法等价 —— 它虽然用 DWT 实测，
+  *      但实测值在 100 Hz 节拍下恒为 10 ms，等价于常数。
+  *
+  * 节拍偶有抖动（例如 printf 阻塞）只会让等效 Kp/Ki 按比例缩放几个百分点，
+  * 不改变闭环性质，也不需要补偿。
+  */
 static void vel_loop_tick(void) {
-    TickType_t now = xTaskGetTickCount();
-    float dt_s;
-
-    if (s_vel_started == 0u) {
-        /* 第一次调用：还没有上一次的时刻，用标称周期。 */
-        dt_s = (float)VEL_LOOP_PERIOD_MS / 1000.0f;
-        s_vel_started = 1u;
-    } else {
-        dt_s = (float)(now - s_vel_last_tick) / (float)APP_TICK_RATE_HZ;
-        if (dt_s <= 0.0f) {
-            /* tick 没有推进（理论上不该发生）：退化成标称周期，绝不把 0 传给 PID。 */
-            dt_s = (float)VEL_LOOP_PERIOD_MS / 1000.0f;
-        }
-    }
-    s_vel_last_tick = now;
-
-    VelCtl_Feed(&s_last_cmd, dt_s);
+    VelCtl_Feed(&s_last_cmd, (float)VEL_LOOP_PERIOD_MS / 1000.0f);
 }
 
 void StartChassisTask(void *argument) {
@@ -111,6 +139,32 @@ void StartChassisTask(void *argument) {
      * 直接进入安全态并把 PWM 清零，所以上电期间四个轮子是静止的。 */
     (void)memset(&s_last_cmd, 0, sizeof(s_last_cmd));
     VelCtl_Init();
+
+    /* ── ★把优先级强制成 app_config.h 的约定值★ ──────────────────────────
+     *
+     * 为什么要在运行期设：本任务的创建发生在 CubeMX 生成区
+     * （Core/Src/freertos.c 的 osThreadNew(StartChassisTask, ...)），
+     * 优先级来自 Robo.ioc 的 "FREERTOS.Tasks01"（那里是 47），
+     * 而本工程的约定值在 app_config.h 的 PRIO_CHASSIS（32）。
+     * 两套数字并存会造成两个真麻烦：
+     *
+     *   ① 优先级次序被破坏。app_config.h:45-54 明确要求
+     *      "OLED 任务必须排在 Chassis 之下"，因为 OLED 里有阻塞式
+     *      HAL_I2C_Mem_Write（HAL_MAX_DELAY），一旦它优先级更高就会
+     *      把速度环彻底饿死 —— 现象是"串口没输出、s_vel_tick 停住、电机不动"，
+     *      而 Safety 优先级更高仍在喂狗，看门狗也不会复位，非常隐蔽。
+     *      而 .ioc 里 OLEDPowerTask = 35 > PRIO_CHASSIS(32)，
+     *      正好会踩这个坑。
+     *
+     *   ② 调试时看到的优先级与实际不符，查问题会绕远路。
+     *
+     * 处理办法：**让 app_config.h 成为唯一真相来源**，在任务体开头用
+     * vTaskPrioritySet() 覆盖 .ioc 的值。这样 CubeMX 里怎么填都不影响实际行为，
+     * 也不需要每次改 .ioc。
+     *
+     * ⚠ 必须放在 VelCtl_Init() **之后**：初始化期间保持 CubeMX 给的高优先级，
+     *   可以避免被 OLED 的阻塞 I2C 打断。 */
+    (void)vTaskPrioritySet(NULL, (UBaseType_t)PRIO_CHASSIS);
 
     last_wake = xTaskGetTickCount();
 
@@ -141,6 +195,7 @@ void StartChassisTask(void *argument) {
             print_counter = 0u;
             print_remote_line(&s_last_cmd);
             print_wheel_line();
+            print_enc_line();
         }
 
         /* 固定周期节拍：vTaskDelayUntil 以绝对时间为基准，不会累积漂移。

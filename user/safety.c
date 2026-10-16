@@ -71,6 +71,17 @@ void StartSafetyTask(void *argument) {
     Safety_WatchdogStart();
 #endif
 
+    /* ── ★把优先级强制成 app_config.h 的约定值★ ──────────────────────────
+     * 本任务由 CubeMX（Core/Src/freertos.c 的 osThreadNew）创建，优先级取自
+     * Robo.ioc 的 FREERTOS.Tasks01（那里是 41），而本工程的约定值在
+     * app_config.h 的 PRIO_SAFETY（34）。
+     *
+     * 为什么必须让约定值生效：喂狗任务必须**高于速度环**，否则速度环
+     * （或任何在它之上的阻塞任务）卡住时，喂狗会被饿死 → 看门狗复位 →
+     * 表现为"莫名重启"，而真正的原因（谁把 CPU 占住了）反而看不到。
+     * 让 app_config.h 成为唯一真相来源，CubeMX 里怎么填都不影响实际次序。 */
+    (void)vTaskPrioritySet(NULL, (UBaseType_t)PRIO_SAFETY);
+
     last_wake = xTaskGetTickCount();
 
     for (;;) {

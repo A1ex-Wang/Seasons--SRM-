@@ -240,14 +240,6 @@ static void post_current_frame(void) {
     remote_in_t frame;
     build_remote_in(&frame);
 
-    /* 丢旧语义（发送端）：非阻塞发送，队列满就**丢弃这一条**，绝不阻塞。
-     * 为什么不能阻塞：Remote 任务被卡住 → SRM_Remote_Poll() 停摆 →
-     * 256 字节环形缓冲被后续字节冲掉 → 后续帧全部 CRC 失败。
-     * 为什么丢“新”而不是丢“旧”：队列深度只有 2，而帧率最高约 100 Hz、
-     * 消费端 1 kHz 每周期都会取，队列真正满住的窗口只可能出现在消费端被
-     * printf 占住的几毫秒内；这几毫秒之后马上会到达更新的一帧，
-     * 数据新鲜度不受影响，而“丢最旧”需要额外的出队/入队两步、在非
-     * 中断上下文里无法原子完成（xQueueOverwrite 只能用于长度 1 的队列）。 */
     if (xQueueSend(q_remote_cmd, &frame, (TickType_t)0) != pdPASS) {
         g_frames_dropped++;
     }
@@ -370,6 +362,14 @@ void StartRemoteTask(void *argument) {
 #if (DEBUG_NO_REMOTE == 0)
     link_online = remote_link_is_online();
 #endif
+
+    /* ── ★把优先级强制成 app_config.h 的约定值★ ──────────────────────────
+     * 本任务由 CubeMX（Core/Src/freertos.c 的 osThreadNew）创建，优先级取自
+     * Robo.ioc（那里是 32），而本工程的约定值是 PRIO_REMOTE（26）。
+     * 让 app_config.h 成为唯一真相来源，避免"改了一处忘了另一处"。
+     * 次序要求见 app_config.h:45-54：OLED 必须在 Remote 之下。 */
+    (void)vTaskPrioritySet(NULL, (UBaseType_t)PRIO_REMOTE);
+
     last_wake = xTaskGetTickCount();
 
     for (;;) {
@@ -415,19 +415,23 @@ void StartRemoteTask(void *argument) {
 }
 
 /*============================================================================*/
-/* 任务创建（全静态分配，不占用 FreeRTOS heap）                                */
+/* 应用层初始化（不再创建任务）                                                */
 /*============================================================================*/
 
-/* 静态任务的栈与 TCB 缓冲。必须是文件作用域 static：
- *   - 生命周期 = 程序，任务永不退出，栈不会失效；
- *   - 不经过 FreeRTOS heap（本项目要求“不占用 FreeRTOS heap”，
- *     因此只能用 xTaskCreateStatic，绝不能用 xTaskCreate）。 */
-static StackType_t s_stack_safety[STACK_SAFETY_WORDS];
-static StaticTask_t s_tcb_safety;
-static StackType_t s_stack_chassis[STACK_CHASSIS_WORDS];
-static StaticTask_t s_tcb_chassis;
-static StackType_t s_stack_remote[STACK_REMOTE_WORDS];
-static StaticTask_t s_tcb_remote;
+/* ★ 这里曾经有 s_stack_chassis / s_tcb_chassis / s_stack_safety / s_tcb_safety /
+ *   s_stack_remote / s_tcb_remote 六个静态缓冲，以及对应的三次 xTaskCreateStatic。
+ *   全部删除 —— 原因见 App_Init() 里的详细说明：
+ *
+ *   Robo.ioc 的 FREERTOS.Tasks01 已经为 ChassisTask / SafetyTask / RemoteTask
+ *   （以及其余 7 个任务）配置好了参数，MX_FREERTOS_Init() 会各创建一次。
+ *   本文件再静态创建一次就会**每个任务两个实例同时在跑**，而它们：
+ *     · 各有一套 static 状态（s_vel_tick / s_vel_last_tick 等）
+ *     · 却共用同一份硬件与数据结构（s_enc[] / s_pid[] / 电机 PWM / 遥控队列）
+ *   实测后果：速度读数被放大约 10 倍（dt_s 掉到 1 ms）、看门狗被喂两遍、
+ *   蓝牙帧被投两遍、s_target_mmps 里新旧运动学公式的符号模式混在一起。
+ *
+ *   现在由 CubeMX 独占创建权，优先级则在各任务体开头用 vTaskPrioritySet()
+ *   强制成 app_config.h 的约定值（见 PRIO_SAFETY / PRIO_CHASSIS / PRIO_REMOTE）。 */
 
 void App_Init(void) {
     /* ── 第 0 步：调试串口 ──────────────────────────────────────────────────
@@ -461,36 +465,52 @@ void App_Init(void) {
                                       &s_queue_cb);
     configASSERT(q_remote_cmd != NULL);
 
-    /* ── 第 2 步：先建消费者（Chassis），再建生产者（Remote）───────────────
-     * 消费端先就位，生产者一开跑就有地方放数据。 */
-    (void)xTaskCreateStatic(StartChassisTask,
-                            NAME_CHASSIS,
-                            (uint32_t)STACK_CHASSIS_WORDS,
-                            NULL,
-                            (UBaseType_t)PRIO_CHASSIS,
-                            s_stack_chassis,
-                            &s_tcb_chassis);
-
-    /* ── 第 2.5 步：遥控任务（始终创建）─────────────────────────────────────
+    /* ── 第 2 步：Chassis 任务由 CubeMX（MX_FREERTOS_Init）创建 ─────────────
      *
-     * 注意：任务**始终创建**，被 DEBUG_NO_REMOTE 屏蔽的是它内部调用的
-     * Remote_ProtocolInit()，而不是任务本身。原因见 StartRemoteTask() 里的说明：
-     * 只要不调用那个初始化入口，就不会触发 configASSERT 把整机卡死，
-     * 同时又保留了任务存在，避免"任务被删掉导致某些路径永不执行"的隐式副作用。 */
-    (void)xTaskCreateStatic(StartRemoteTask,
-                            NAME_REMOTE,
-                            (uint32_t)STACK_REMOTE_WORDS,
-                            NULL,
-                            (UBaseType_t)PRIO_REMOTE,
-                            s_stack_remote,
-                            &s_tcb_remote);
+     * ★★★ 这里绝对不要再创建一次 Chassis 任务 ★★★
+     *
+     * 本工程踩过这个大坑，现象是"速度读数被放大约 10 倍、PID 完全调不出来"：
+     *
+     *   Core/Src/freertos.c:183 已经用 osThreadNew(StartChassisTask, ...) 建过一次
+     *   （CubeMX 生成，优先级 osPriorityHigh7 → FreeRTOS 优先级 47）。
+     *   如果这里再用 xTaskCreateStatic 建第二次（优先级 PRIO_CHASSIS = 32），
+     *   就会有**两个 Chassis 任务实例同时在跑**，而它们的：
+     *
+     *     s_vel_tick / s_vel_last_tick / s_vel_started   ← 各自一份（static 变量）
+     *     s_enc[] / s_pid[] / s_target_mmps[] / 电机 PWM ← **共用同一份**
+     *
+     *   高优先级实例会抢占低优先级实例，于是"两次调用之间的真实时间"不再是 10 ms，
+     *   chassiscontrol.c 算出的 dt_s 常常掉到 1 ms，而
+     *       speed = delta × ENCODER_COUNTS_TO_MMPS / dt_s
+     *   分母小 10 倍 → **速度读数大 10 倍**。
+     *
+     *   实测证据：s_enc[2].min_dt_s = 0.001（出现过 1 ms 的分母），
+     *             s_enc[2].max_raw_mmps = 255086 mm/s（轮子上限只有 1046），
+     *             s_target_mmps 里新旧运动学公式的符号模式混在一起
+     *             （因为两个实例在同一时刻各自算了一遍指令）。
+     *
+     * ★ 正确的做法（本工程采用）★
+     *   让 CubeMX 建的这一次成为**唯一**的一次：删掉本文件里重复的 xTaskCreateStatic。
+     *   任务的优先级由任务体开头的 vTaskPrioritySet() 强制成 app_config.h 的约定值，
+     *   于是"谁创建"和"参数从哪来"两件事都只有一个真相来源，
+     *   且**不需要每次改完 .ioc 再手工修一遍代码**。
+     *
+     *   ⚠ Robo.ioc 里所有任务都是 Dynamic（osThreadNew，栈从 heap 拿）。
+     *     这违背本工程"全部静态分配"的约定，但它是 CubeMX 的既定配置，
+     *     改它需要动 .ioc；功能上无影响（heap 由 scheduler 起来后分配，
+     *     本工程 configTOTAL_HEAP_SIZE 足够）。若以后要严格静态，
+     *     在 MX 的 FreeRTOS 任务对话框里把 Allocation 改成 Static 即可。 */
 
-    /* ── 第 3 步：安全任务（最高优先级）──────────────────────────────────── */
-    (void)xTaskCreateStatic(StartSafetyTask,
-                            NAME_SAFETY,
-                            (uint32_t)STACK_SAFETY_WORDS,
-                            NULL,
-                            (UBaseType_t)PRIO_SAFETY,
-                            s_stack_safety,
-                            &s_tcb_safety);
+    /* ── 第 2.5 / 3 步：Remote 与 Safety 任务同样**不在这里创建** ───────────
+     *
+     * 它们和 Chassis 是同一个问题：Robo.ioc 的 FREERTOS.Tasks01 里已经列了
+     * RemoteTask(32) 和 SafetyTask(41)，MX_FREERTOS_Init() 会用 osThreadNew
+     * 各建一次。这里如果再静态建一次，就会有两个实例同时在跑：
+     *
+     *   · Safety 跑两遍 → **看门狗被喂两遍**（掩盖真正的喂狗时序问题）
+     *   · Remote 跑两遍 → 蓝牙帧被解析两遍、**队列被投两遍**（指令时序乱）
+     *   · 三者的优先级还各不相同，互相抢占，dt_s 被算成 1 ms
+     *
+     * 所以三个任务统一交给 CubeMX 创建，优先级在各自任务体里用
+     * vTaskPrioritySet() 强制成 app_config.h 的约定值。 */
 }
