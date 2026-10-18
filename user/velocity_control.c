@@ -240,8 +240,29 @@ static void compute_body_cmd(const remote_in_t *cmd, float dt_s,
     n_lx = axis_normalized(cmd->lx);
     n_rx = axis_normalized(cmd->rx);
 
-    /* ly 正 = 前进（你和协议约定的），直接用；单位 mm/s。 */
-    vy_t = n_ly * (MAX_VXY_MS * 1000.0f);
+    /* ── ly → vy（前后）──────────────────────────────────────────────────
+     *
+     * ★ 这里对 ly 取负，是本工程实测标定的结果，不要改回正号 ★
+     *
+     * 协议层对 ly 的定义是"**正 = 摇杆向下**"（见 app_types.h 里 remote_in_t
+     * 的字段注释），而遥控器习惯里"左摇杆向下"就是后退。所以：
+     *
+     *     ly > 0  →  摇杆向下  →  应当后退
+     *     ly < 0  →  摇杆向上  →  应当前进
+     *
+     * 而本工程的内部约定是"**vy > 0 = 车体前进**"（mecanum_inverse 里
+     * w[FL]=vx+vy、w[RR]=vx+vy，正向 vy 让左前/右后轮一起往前推）。
+     * 所以要取负号把两者对齐：
+     *
+     *     vy_t = -n_ly * MAX_VXY
+     *
+     * 实测验证（改之前）：ly=+256 时 w[RL] = -vy = -450（ref 为负）且车实际后退；
+     * 改之后 ly=+256 → vy = -450 → w[RL] = -vy = **+450**（ref 为正）且车前进。
+     *
+     * ⚠ 只影响前后分量。vx（左右）与 ω（自旋）的公式一个字都没动，
+     *   所以左右方向和自旋方向保持标定后的正确状态；
+     *   PID 反馈方向、编码器 MOTOR_SIGN_* 也完全不受影响。 */
+    vy_t = -n_ly * (MAX_VXY_MS * 1000.0f);
     /* lx 负 = 向左，而车体 y 轴向左为正，所以这里要取负号。 */
     vx_t = -n_lx * (MAX_VXY_MS * 1000.0f);
     /* rx 正 = 顺时针，而 ω 以逆时针为正，所以取负号。 */
@@ -533,7 +554,15 @@ float VelCtl_TelemSpeedFR(void) { return Encode_GetSpeedMmps(&s_enc[WHEEL_FR]); 
  *   VelCtl_TelemDutyRL()   ↔ s_cmd_snapshot.duty[2]（写入的带符号占空比）
  */
 
-/** @brief 车身前进指令 vy [mm/s]（>0 = 前进）。确认"指令"这一级是否正确。 */
+/**
+  * @brief 车体前进速度指令 vy [mm/s]（**>0 = 车体前进**）。
+  *
+  * ⚠ 注意符号关系：因为协议里 ly 是"正 = 摇杆向下"，所以
+  *     ly > 0  →  vy **< 0**（摇杆向下 = 后退）
+  *     ly < 0  →  vy **> 0**（摇杆向上 = 前进）
+  *   判断"是前进还是后退"请看 vy 的符号，或直接看 s_target_mmps 与实车动作，
+  *   不要拿 ly 的符号去对。
+  */
 float VelCtl_TelemCmdVy(void) { return s_vy_prev; }
 
 /** @brief RL 轮（M3）目标轮速 [mm/s]，正数 = 该轮物理前进。 */
