@@ -70,7 +70,9 @@ extern "C" {
 /* vvv I2C config vvv */
 
 #ifndef SSD1306_I2C_PORT
-#define SSD1306_I2C_PORT        hi2c1
+/* 兜底默认值。真正生效的值在 user/ssd1306/ssd1306_conf.h（那里是 hi2c2）。
+ * 这里同步改成 hi2c2，避免"conf 里没定义时悄悄回退到 I2C1"这种难查的情况。 */
+#define SSD1306_I2C_PORT        hi2c2
 #endif
 
 #ifndef SSD1306_I2C_ADDR

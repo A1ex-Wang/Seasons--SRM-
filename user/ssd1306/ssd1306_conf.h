@@ -36,10 +36,34 @@
 /* 必须包含 i2c.h：I2C_HandleTypeDef 的类型定义在那里（同时 extern hi2c1/hi2c2）。 */
 #include "i2c.h"
 
-/* OLED 独占 I2C1（PB8=SCL / PB9=SDA，400 kHz）。
- * IMU 在 I2C2（PB10/PB11，100 kHz），两条总线互相独立；但 I2C1 的总线互斥锁
- * 仍然必须持有（见 user/OLEDpower.c），以后往 I2C1 上再加设备时不会与刷屏冲突。 */
-#define SSD1306_I2C_PORT        hi2c1
+/* OLED 走 **I2C2**（PB10 = SCL / PB11 = SDA，400 kHz）。
+ *
+ * ★ 为什么从 I2C1 改到 I2C2（别再改回去）★
+ *   实机接线是 PB10/PB11，而 CubeMX 里 I2C2 的初始化正是这两个引脚：
+ *       i2c.c:125  PB10 ------> I2C2_SCL
+ *       i2c.c:126  PB11 ------> I2C2_SDA
+ *       i2c.c:71   hi2c2.Init.ClockSpeed = 400000   （SSD1306 支持 400 kHz）
+ *       i2c.c:132  GPIO_InitStruct.Alternate = GPIO_AF4_I2C2
+ *   原来这里写的是 hi2c1（PB8/PB9），那组引脚上没有接屏，所以 0x3C 一直不应答
+ *   （实测现象：OLED 探测失败、"OLED not responding at 0x3C"）。
+ *
+ * ⚠ 关于引脚的两个硬事实：
+ *   1) STM32F407 的 I2C2_SDA 只有 **PB11 / PF0 / PH5** 三个可选（AF4），
+ *      **没有 PE11**。所以"SDA 接 PE11"是不成立的。
+ *   2) PE11 在本工程里是 **TIM1_CH2 = M2_ENC_B = FR（右前）轮编码器 B 相**
+ *      （main.h 的 M2_ENC_B_Pin / tim.c:542）。若把 SDA 挪到 PE11，
+ *      FR 轮的编码器会直接失效。
+ *
+ * ★ 关于 I2C2 的独占性 ★
+ *   i2c.c 里 MX_I2C2_Init() 已由 main.c:104 调用，硬件是初始化好的；
+ *   而 user/sensorimu.c 目前是空壳（IMU 尚未实现），所以 I2C2 现在完全空闲。
+ *   以后若真的往 I2C2 上挂 IMU，**必须复用同一把总线互斥锁**
+ *   （user/OLEDpower.c 的 g_oled_i2c_mutex），否则两条任务同时访问会互相打断。
+ *
+ * ★ 地址 ★
+ *   SSD1306 的 7 位地址是 0x3C；HAL 的 xxx_Addr 参数要求 8 位（已左移）格式。
+ *   少数模块是 0x3D，若探测仍失败可试着改成 (0x3D << 1)。 */
+#define SSD1306_I2C_PORT        hi2c2
 /* SSD1306 的 7 位地址是 0x3C；HAL 的 xxx_Addr 参数要求 8 位（已左移）格式。 */
 #define SSD1306_I2C_ADDR        (0x3C << 1)
 
@@ -64,7 +88,17 @@
  * 4 行 y = 0/18/36/54 正好铺满 128×64 屏）；Font_6x8 留给以后的密集调试页。
  * 被注释掉的 7x10 / 16x26 / 16x24 / 16x15 四套字模在 Flash 里合计约 25 KB。 */
 #define SSD1306_INCLUDE_FONT_6x8
-//#define SSD1306_INCLUDE_FONT_7x10
+/* ★ Font_7x10 必须启用（本工程的四行显示布局用它）★
+ *   为什么不能用 Font_11x18 显示四行：
+ *     ssd1306_WriteChar()（ssd1306.c:231）有一条硬检查：
+ *         if (... || SSD1306_HEIGHT < (SSD1306.CurrentY + Font.height)) return 0;
+ *     屏高 64，Font_11x18 高 18。前三行 y=0/18/36 都满足 (y+18 <= 64)，
+ *     但第四行 y=54 时 54+18=72 > 64 → **整行 32 个像素一个都不画**。
+ *     （注意：不是"只裁掉下半部分"，而是在 WriteChar 里直接 return，
+ *      根本走不到 DrawPixel 的边界裁剪。）
+ *   Font_7x10 高 10，行距取 16：y=0/16/32/48，最后一行 48+10=58 <= 64，
+ *   四行全部完整可见。 */
+#define SSD1306_INCLUDE_FONT_7x10
 #define SSD1306_INCLUDE_FONT_11x18
 //#define SSD1306_INCLUDE_FONT_16x26
 //#define SSD1306_INCLUDE_FONT_16x24

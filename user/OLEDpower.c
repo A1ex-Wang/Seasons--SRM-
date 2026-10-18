@@ -33,7 +33,7 @@
 
 #include "adc.h"   /* hadc3 */
 #include "dma.h"   /* MX_DMA_Init 已在 main.c 里调用，DMA 控制器时钟已开 */
-#include "i2c.h"   /* hi2c1：SSD1306 的 I2C 端口 */
+#include "i2c.h"   /* hi2c2：SSD1306 的 I2C 端口（PB10=SCL / PB11=SDA） */
 
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
@@ -95,7 +95,7 @@ static volatile float s_zero_offset_v; /**< 电流通道零点电压（V），�
 /*============================================================================*/
 
 power_monitor_t g_power;        /* 对外快照，定义见 OLEDpower.h */
-SemaphoreHandle_t g_i2c1_mutex; /* I2C1 总线互斥锁，定义见 OLEDpower.h */
+SemaphoreHandle_t g_oled_i2c_mutex; /* OLED 所在 I2C2 的总线互斥锁，定义见 OLEDpower.h */
 
 /* 任务本体、静态栈与任务控制块。
  * 为什么用 xTaskCreateStatic 而不是 CubeMX 里那个 osThreadNew：
@@ -108,8 +108,8 @@ SemaphoreHandle_t g_i2c1_mutex; /* I2C1 总线互斥锁，定义见 OLEDpower.h 
  *
  * Robo.ioc 的 FREERTOS.Tasks01 里 OLEDPowerTask 是 Dynamic，MX_FREERTOS_Init()
  * 已经用 osThreadNew 创建过一次。本文件曾经再用 xTaskCreateStatic 建第二次，
- * 于是**两个 OLED 任务实例同时在跑**，而它们共用同一个 I2C1 与同一个
- * g_i2c1_mutex：两个实例各建一次互斥锁（第二次覆盖全局句柄）、刷屏互相打断
+ * 于是**两个 OLED 任务实例同时在跑**，而它们共用同一个 I2C2 与同一个
+ * g_oled_i2c_mutex：两个实例各建一次互斥锁（第二次覆盖全局句柄）、刷屏互相打断
  * → 屏幕撕裂、I2C 报错，并且白吃一份 CPU（每次刷屏约 25 ms 阻塞）。
  *
  * 这和 Chassis / Safety / Remote 是同一个 bug（详见 user/remote.c 的 App_Init()
@@ -120,6 +120,87 @@ SemaphoreHandle_t g_i2c1_mutex; /* I2C1 总线互斥锁，定义见 OLEDpower.h 
 static float s_filtered_v;  /**< 电压低通状态 */
 static float s_filtered_i;  /**< 电流低通状态 */
 static uint8_t s_ratio_pct; /**< 上次更新到的电量百分比（大电流时保持不变） */
+
+/*============================================================================*/
+/* 遥测快照（只读，调试电压/电流采样专用；不参与任何控制计算）                  */
+/*============================================================================*/
+
+/**
+  * @brief ADC 启动结果（HAL_ADC_Start_DMA 的返回值）。
+  * 0 = HAL_OK。非 0 说明采样从未启动，此时下面所有量都恒为 0 —— 排障第一站。
+  */
+static HAL_StatusTypeDef s_adc_st;
+
+/** @brief 上一个 10 ms 周期累计的样本轮数。0 = DMA 没在跑。 */
+static volatile uint32_t s_telem_n;
+
+/** @brief 电压通道过采样均值（12 位原始码）。 */
+static volatile uint32_t s_telem_raw_v;
+
+/** @brief 电流通道过采样均值（12 位原始码）。 */
+static volatile uint32_t s_telem_raw_i;
+
+/**
+  * @brief 瞬时 DMA 缓冲值（每周期刷新，不看平均值，用来判断"引脚上到底是什么电平"）。
+  * [0] = rank1 = ADC_CHANNEL_9（PF3，电流通道）
+  * [1] = rank2 = ADC_CHANNEL_14（PF4，电压通道）
+  */
+static volatile uint32_t s_telem_dma_i;
+static volatile uint32_t s_telem_dma_v;
+
+/** @brief 上一次任务循环的实际周期（ms）。用来发现"10 ms 被拖长了"。 */
+static volatile uint32_t s_telem_period_ms;
+
+/**
+  * @brief OLED 屏探测状态：0 = 未探测，1 = 在线（正常刷屏），2 = 离线（跳过刷屏）。
+  *
+  * ★★ 为什么必须探测（本工程踩过的坑）★★
+  *
+  *   user/ssd1306/ssd1306.c 里所有 I2C 写都是
+  *       HAL_I2C_Mem_Write(..., HAL_MAX_DELAY);      // 无限超时
+  *   而 ssd1306_UpdateScreen() 一次要发 32 笔事务（24 条命令 + 8 页数据）。
+  *   **OLED 没接或不应答时，每一笔都在等超时**，一次刷屏实测约 772 ms，
+  *   把本任务 10 ms 的采样周期拖成约 862 ms。
+  *
+  *   后果（实测）：遥测里每周期样本数 n = 38715，
+  *   而理论上 10 ms 只有 44900 × 0.01 = 449 个。也就是说
+  *   "10 ms 过采样"实际上变成了"862 ms 过采样" —— 电压/电流的低通时间常数、
+  *   电量更新的节拍全部被拉长 86 倍。
+  *
+  *   本任务优先级是最低的 PRIO_OLEDPOWER(20)，所以底盘/遥控不受影响；
+  *   但采样节拍被破坏，调电压时数据会失真。
+  *
+  *   对策：刷屏前用 HAL_I2C_IsDeviceReady() 做一次**有界超时**的探测
+  *   （2 次尝试 × 5 ms），不应答就直接跳过这一帧。探测本身耗时 <10 ms，
+  *   远小于原来的 772 ms，采样周期立刻回到 10 ms。
+  */
+static volatile uint8_t s_oled_state;
+
+/** @brief 屏探测参数：尝试次数 / 每次超时（ms）。都是小数，探测开销可忽略。 */
+#define OLED_PROBE_TRIALS 2u
+#define OLED_PROBE_TIMEOUT_MS 5u
+
+/**
+  * @brief 调试打印开关（1 = 每 POWER_DEBUG_PRINT_PERIOD_MS 打一行到 USART6）。
+  *
+  * ★ 当前值为 1（打开）—— 正处在调电压采样的阶段 ★
+  *   调完电压后建议改成 0，让调试串口恢复干净。
+  *
+  * 为什么打开它不会干扰遥控/底盘：
+  *   1) 打印走 printf → USART6（见 debug_uart.c），与蓝牙口 USART2 **物理隔离**，
+  *      不会污染 SRM 帧；
+  *   2) 频率只有 2 Hz（约 110 字节/次 ≈ 220 B/s），而底盘那 3 行 10 Hz 约
+  *      2700 B/s —— 差一个数量级；
+  *   3) 本任务优先级 PRIO_OLEDPOWER(20) **低于** Chassis(32)/Remote(26)/Safety(34)，
+  *      打印期间随时被它们抢占，不会拖慢速度环或蓝牙解析。
+  *
+  * 可用编译选项覆盖：-DPOWER_DEBUG_PRINT=0 */
+#ifndef POWER_DEBUG_PRINT
+#define POWER_DEBUG_PRINT 1
+#endif
+
+/** @brief 调试打印周期（ms）。2 Hz 足够看趋势，又不会刷屏。 */
+#define POWER_DEBUG_PRINT_PERIOD_MS 500u
 
 /*============================================================================*/
 /* 临界区                                                                      */
@@ -255,6 +336,9 @@ static void power_measurement_update(void)
 
     n = take_accumulator(&sum_i, &sum_v);
 
+    /* 遥测：样本数与原始码先记下来（即使 n==0 也要记录，便于看出 DMA 停了）。 */
+    s_telem_n = n;
+
     /* ── 还没有样本：保持上一次结果，绝不把 0 灌进滤波器 ────────────────────
      * 只在启动头几毫秒（DMA 刚启动）或 DMA 被停掉时出现。此时若用 0 更新低通，
      * 滤波状态会被拉坏，要几百毫秒才能恢复。 */
@@ -264,6 +348,17 @@ static void power_measurement_update(void)
 
     mean_i_raw = (float)sum_i / (float)n;
     mean_v_raw = (float)sum_v / (float)n;
+
+    /* 遥测：把过采样均值存成整数原始码（四舍五入），供 Ozone / 串口直接看。
+     * 用整数是为了避免在 Ozone 里看到 "2047.9998" 这种浮点精度噪声。 */
+    s_telem_raw_i = (uint32_t)(mean_i_raw + 0.5f);
+    s_telem_raw_v = (uint32_t)(mean_v_raw + 0.5f);
+
+    /* 遥测：瞬时 DMA 值。【用它判断"引脚上到底是什么电平"】
+     * rawI/rawV 是 10 ms 内的均值，适合看稳定性；
+     * dmaI/dmaV 是"此刻"那一轮转换的结果，适合排查"是不是某一通道恒 0/恒满"。 */
+    s_telem_dma_i = (uint32_t)g_adc_dma[ADC_CH_CURRENT];
+    s_telem_dma_v = (uint32_t)g_adc_dma[ADC_CH_VOLTAGE];
 
     /* ── 电流 ───────────────────────────────────────────────────────────────
      * I[A] = (V_adc − V_zero) / (R_shunt × Gain) = (V_adc − V_zero) / 0.02
@@ -316,28 +411,51 @@ static void power_measurement_update(void)
 /* OLED 显示                                                                   */
 /*============================================================================*/
 
-/* 11×18 等宽字体：宽 11 px、行高 18 px。四行 y = 0/18/36/54。
- * 第 4 行底部落在 54 + 18 = 72 px，超出 64 px 的部分由 ssd1306_DrawPixel 的
- * 边界检查自动裁掉（它内部有 x/y 越界判断），所以最后一行只显示上半部分 ——
- * 这是 128×64 屏上放 4 行大字的常规取舍，不会花屏也不会越界写内存。
+/* ★★★ 显示布局：4 行还是 3 行（本工程踩过的坑）★★★
  *
- * ★ 行宽核算（11 px/字符，屏宽 128 px → **每行最多 11 个字符**）：
- *     "Voltage: 12.60 V"   = 16 字符 = 176 px  → 超出 48 px
- *     "Current: +1.23 A"   = 16 字符 = 176 px  → 超出 48 px
- *     "Power: 15.24 W"     = 14 字符 = 154 px  → 超出 26 px
- *     "Battery: 100 %"     = 14 字符 = 154 px  → 超出 26 px
- *   也就是说用户给的字面格式在 Font_11x18 下**每行都会裁掉尾部 2~4 个字符**。
- *   两种解决办法都留着，用下面的宏切换：
- *     OLED_LABEL_COMPACT = 1（默认）：缩短标签，四行全部完整显示（≤11 字符）；
- *     OLED_LABEL_COMPACT = 0        ：完全照字面格式，尾部小数字符会被裁掉。
- *   若想要"标签 + 大字数值"的排版，理论上应把数值换成 Font_16x24 并恢复该字体，
- *   但 16×24 一行只有 8 个字符、四行需要 96 px 高，128×64 屏放不下，
- *   所以本模块不做这种混合排版。 */
+ * ssd1306_WriteChar()（user/ssd1306/ssd1306.c:231）在画任何像素之前有一条硬检查：
+ *     if (SSD1306_WIDTH < (SSD1306.CurrentX + char_width) ||
+ *         SSD1306_HEIGHT < (SSD1306.CurrentY + Font.height))
+ *         return 0;                      // ← 整行直接放弃，一个像素都不画
+ *
+ * 屏高 SSD1306_HEIGHT = 64，于是：
+ *
+ *   「Font_11x18（高 18），行距 18，四行 y = 0/18/36/54」
+ *       第 1 行 0+18  = 18 ≤ 64  ✔
+ *       第 2 行 18+18 = 36 ≤ 64  ✔
+ *       第 3 行 36+18 = 54 ≤ 64  ✔
+ *       第 4 行 54+18 = 72 > 64  ✘ **整行不画** → 屏上只有三行
+ *     （实测现象：V/I/P 有，SOC 完全不见。
+ *       注意它**不是**"只显示上半部分"——在 WriteChar 里就 return 了，
+ *       根本走不到 DrawPixel 的边界裁剪。旧注释写错了这一点。）
+ *
+ *   「Font_7x10（高 10），行距 16，四行 y = 0/16/32/48」
+ *       最后一行 48+10 = 58 ≤ 64  ✔ 四行全部完整可见
+ *
+ * 所以：
+ *   OLED_SOC_ON_4TH_LINE = 1（默认）→ 四行 Font_7x10，V/I/P/SOC 都看得见，字较小
+ *   OLED_SOC_ON_4TH_LINE = 0        → 三行 Font_11x18，V/I/P 字号大很多，但 SOC 看不见 */
+#ifndef OLED_SOC_ON_4TH_LINE
+#define OLED_SOC_ON_4TH_LINE 1
+#endif
+
+/* Font_11x18 的行距（三行布局用） */
+#define OLED_LINE_HEIGHT 18u
+
+/* Font_7x10 的行距（四行布局用）。取 16 而不是 10，是为了在 10 px 字高之间
+ * 留 6 px 空隙，看起来不挤；48 + 10 = 58 ≤ 64，四行仍安全。 */
+#define OLED_LINE_PITCH_7x10 16u
+
+/* ★ 行宽核算 ★
+ *   Font_11x18：11 px/字符 → 每行最多 11 字符（128 / 11 = 11.6）
+ *   Font_7x10 ： 7 px/字符 → 每行最多 18 字符（128 / 7  = 18.3）
+ *   本模块实际使用的最长行是 "I:+20.00 A" = 10 字符：
+ *       11x18 → 110 px ✔ 刚好放得下
+ *        7x10 →  70 px ✔ 余量很大
+ *   OLED_LABEL_COMPACT 的意义：在 11x18 下必须缩短标签，否则会裁尾。 */
 #ifndef OLED_LABEL_COMPACT
 #define OLED_LABEL_COMPACT 1
 #endif
-
-#define OLED_LINE_HEIGHT 18u
 
 #if (OLED_LABEL_COMPACT == 1)
 /* 紧凑标签：最宽 "V:xx.xx V" = 9 字符 = 99 px，留足宽度。 */
@@ -418,50 +536,166 @@ static void OLED_ShowFloat(uint8_t x, uint8_t y, float value, SSD1306_Font_t fon
 }
 
 /**
+  * @brief 把 float 格式化成"两位小数"的文本，**纯整数算法**。
+  *
+  * ★★ 为什么不能用 snprintf("%.2f")（本工程实测过的坑）★★
+  *
+  *   本工程链接的是 **newlib-nano**，它的 printf/snprintf 默认**不带浮点支持**。
+  *   遇到 `%.2f` 不报错、也不打印 `%f` 字面量，而是**输出空字符串**。
+  *
+  *   后果（实测现象）：屏幕上只剩标签和单位，数值是空的 ——
+  *       "V:%.2f V"  →  "V: V"
+  *       "I:%+.2f A" →  "I: A"
+  *       "P:%.2f W"  →  "P: W"
+  *   这正是"显示屏只有单位、没有具体数值"的原因。串口那边的 `[power]` 行是
+  *   整数格式（%ld），所以照常显示 —— 这也解释了为什么串口正常、屏不正常。
+  *
+  *   两种修法：
+  *     a) 链接时加 `-u _printf_float`：能用 %f，但要多占 3~6 KB Flash；
+  *     b) **整数算法自格式化**（本函数采用，与 OLED_ShowFloat 完全同一套做法）：
+  *        ① ×100 缩放到百分位；② 四舍五入成整数；
+  *        ③ 整数除法/取模拆出整数位与小数位；④ 只用 %ld 输出。
+  *   选 b：Flash 零代价，行为确定，不依赖链接选项。
+  *
+  * @param buf        输出缓冲区（建议 ≥12 字节）
+  * @param cap        缓冲区大小
+  * @param value      待格式化的值
+  * @param force_sign 1 = 非负数也带 '+'（用于电流方向）；0 = 只有负数带 '-'
+  */
+static void fmt_f2(char *buf, size_t cap, float value, uint8_t force_sign)
+{
+    int32_t scaled;
+    int32_t whole;
+    int32_t frac;
+    uint8_t neg = 0u;
+
+    if ((buf == NULL) || (cap == 0u)) {
+        return;
+    }
+
+    /* ① + ② 缩放到百分位并四舍五入（正数加 0.5、负数减 0.5） */
+    if (value >= 0.0f) {
+        scaled = (int32_t)((value * 100.0f) + 0.5f);
+    } else {
+        scaled = (int32_t)((value * 100.0f) - 0.5f);
+    }
+
+    /* 限幅：整数部分最多 4 位（±9999.99），防止缓冲区越界。
+     * 本工程正常量程是 10.5~12.6 V、0~20 A、0~260 W，远碰不到。 */
+    if (scaled > 999999) {
+        scaled = 999999;
+    } else if (scaled < -999999) {
+        scaled = -999999;
+    }
+
+    if (scaled < 0) {
+        neg = 1u;
+        scaled = -scaled;
+    }
+    whole = scaled / 100;
+    frac = scaled % 100;
+
+    /* ③ 只输出整数格式，绝不出现 %f */
+    if (neg != 0u) {
+        (void)snprintf(buf, cap, "-%ld.%02ld", (long)whole, (long)frac);
+    } else if (force_sign != 0u) {
+        (void)snprintf(buf, cap, "+%ld.%02ld", (long)whole, (long)frac);
+    } else {
+        (void)snprintf(buf, cap, "%ld.%02ld", (long)whole, (long)frac);
+    }
+}
+
+/**
   * @brief 刷一帧：清缓冲 → 画四行 → 推屏。
   *
-  * ★ 调用者必须已持有 g_i2c1_mutex。
+  * ★ 调用者必须已持有 g_oled_i2c_mutex。
   * ★ 耗时：ssd1306_UpdateScreen() 在 400 kHz 上发 1024 字节数据 + 24 字节命令，
   *   实测约 25 ms（库内是阻塞式 HAL_I2C_Mem_Write，超时参数 HAL_MAX_DELAY）。
+  * ★ 所有浮点都用 fmt_f2() 转成文本，**这里不允许出现 "%.2f"**
+  *   （newlib-nano 无浮点 printf 支持，会输出空字符串 → 屏上只剩单位）。
+  *
+  * ★★ 为什么用 Font_7x10 而不是 Font_11x18（本工程踩过的坑）★★
+  *
+  *   ssd1306_WriteChar()（ssd1306.c:231）在画任何像素之前有一条硬检查：
+  *       if (... || SSD1306_HEIGHT < (SSD1306.CurrentY + Font.height)) return 0;
+  *
+  *   屏高 SSD1306_HEIGHT = 64。
+  *     · Font_11x18 高 18：前三行 y=0/18/36 → 18/36/54 都 ≤ 64 ✔
+  *       **第四行 y=54 → 54+18 = 72 > 64 → 整行直接 return，一个像素都不画。**
+  *       （实测现象：屏上只有三行，SOC 完全不见。）
+  *       注意这不是"只显示上半部分"——它根本走不到 DrawPixel 的边界裁剪。
+  *     · Font_7x10 高 10，行距取 16：y=0/16/32/48 → 最多 58 ≤ 64 ✔ 四行全可见。
+  *
+  *   若想让字号更大，把 OLED_SOC_ON_4TH_LINE 设为 0：退回"三行 Font_11x18"，
+  *   V/I/P 会明显更大，但 SOC 显示不出来（屏高不够第四行 18 px）。
   */
 static void oled_render(void)
 {
-    char line[24];
+    char num[12];    /* 单个数值，如 "-12.34" */
+    char line[28];   /* 一整行，如 "V:11.91 V" */
     /* 快照：g_power 是 volatile，先取到本地再格式化，避免读到"半新半旧"的组合 */
     float volt = g_power.battery_v;
     float curr = g_power.current_a;
     float powr = g_power.power_w;
     unsigned pct = (unsigned)g_power.ratio_pct;
 
+#if (OLED_SOC_ON_4TH_LINE != 0)
+    /* ── 四行布局（Font_7x10，行距 16，占 58/64 px）────────────────────────
+     * 行宽：7 px/字符、屏宽 128 px → 每行最多 18 字符。
+     *   "V:11.91 V" = 9 字符 = 63 px  ✔ 余量充足 */
     ssd1306_Fill(Black);
 
     /* 第一行：电压 */
-    (void)snprintf(line, sizeof(line), OLED_LABEL_VOLTAGE "%.2f V", volt);
-    ssd1306_SetCursor(0u, 0u * OLED_LINE_HEIGHT);
+    fmt_f2(num, sizeof(num), volt, 0u);
+    (void)snprintf(line, sizeof(line), OLED_LABEL_VOLTAGE "%s V", num);
+    ssd1306_SetCursor(0u, 0u);
+    (void)ssd1306_WriteString(line, Font_7x10, White);
+
+    /* 第二行：电流（强制带符号，看清方向） */
+    fmt_f2(num, sizeof(num), curr, 1u);
+    (void)snprintf(line, sizeof(line), OLED_LABEL_CURRENT "%s A", num);
+    ssd1306_SetCursor(0u, OLED_LINE_PITCH_7x10);
+    (void)ssd1306_WriteString(line, Font_7x10, White);
+
+    /* 第三行：功率 */
+    fmt_f2(num, sizeof(num), powr, 0u);
+    (void)snprintf(line, sizeof(line), OLED_LABEL_POWER "%s W", num);
+    ssd1306_SetCursor(0u, 2u * OLED_LINE_PITCH_7x10);
+    (void)ssd1306_WriteString(line, Font_7x10, White);
+
+    /* 第四行：剩余电量（本来就是整数，%3u 在 newlib-nano 下完全正常） */
+    (void)snprintf(line, sizeof(line), OLED_LABEL_BATTERY "%3u%%", pct);
+    ssd1306_SetCursor(0u, 3u * OLED_LINE_PITCH_7x10);
+    (void)ssd1306_WriteString(line, Font_7x10, White);
+
+#else
+    /* ── 三行大字号布局（Font_11x18，行距 18，占 54/64 px）──────────────
+     * 字号明显更大、更好看，但屏高 64 px 放不下第四行 18 px 的字，
+     * 所以 **SOC 无法显示**（原因见上面的函数注释）。 */
+    ssd1306_Fill(Black);
+
+    fmt_f2(num, sizeof(num), volt, 0u);
+    (void)snprintf(line, sizeof(line), OLED_LABEL_VOLTAGE "%s V", num);
+    ssd1306_SetCursor(0u, 0u);
     (void)ssd1306_WriteString(line, Font_11x18, White);
 
-    /* 第二行：电流。%+.2f 让正数也带 +，一眼看清方向（当前单向下恒为 +）。
-     * 字面较宽时会被右侧裁掉，见文件上方 OLED_LABEL_COMPACT 处的行宽核算。 */
-    (void)snprintf(line, sizeof(line), OLED_LABEL_CURRENT "%+.2f A", curr);
+    fmt_f2(num, sizeof(num), curr, 1u);
+    (void)snprintf(line, sizeof(line), OLED_LABEL_CURRENT "%s A", num);
     ssd1306_SetCursor(0u, 1u * OLED_LINE_HEIGHT);
     (void)ssd1306_WriteString(line, Font_11x18, White);
 
-    /* 第三行：功率 */
-    (void)snprintf(line, sizeof(line), OLED_LABEL_POWER "%.2f W", powr);
+    fmt_f2(num, sizeof(num), powr, 0u);
+    (void)snprintf(line, sizeof(line), OLED_LABEL_POWER "%s W", num);
     ssd1306_SetCursor(0u, 2u * OLED_LINE_HEIGHT);
     (void)ssd1306_WriteString(line, Font_11x18, White);
-
-    /* 第四行：电量百分比（整数，不用 %f） */
-    (void)snprintf(line, sizeof(line), OLED_LABEL_BATTERY "%3u%%", pct);
-    ssd1306_SetCursor(0u, 3u * OLED_LINE_HEIGHT);
-    (void)ssd1306_WriteString(line, Font_11x18, White);
+#endif /* OLED_SOC_ON_4TH_LINE */
 
     /* 推屏（唯一真正走 I2C 的动作） */
     ssd1306_UpdateScreen();
 }
 
 /**
-  * @brief 上电自检画面。调用者必须已持有 g_i2c1_mutex。
+  * @brief 上电自检画面。调用者必须已持有 g_oled_i2c_mutex。
   *
   * 把实测到的零点电压直接显示出来：这是现场判断"校准是否成功"的唯一直观依据。
   * REF1/REF2 接 GND 时这里应该是几毫伏；若显示 0.8 V 以上，说明 REF 实际接的
@@ -483,7 +717,7 @@ static void oled_show_banner(void)
     (void)ssd1306_WriteString("Vzero", Font_11x18, White);
 
     ssd1306_SetCursor(0u, 2u * OLED_LINE_HEIGHT);
-    (void)ssd1306_WriteString("CH9/CH14 I2C1", Font_11x18, White);
+    (void)ssd1306_WriteString("CH9/CH14 I2C2", Font_11x18, White);
 
     ssd1306_UpdateScreen();
 }
@@ -521,6 +755,7 @@ void OLEDPower_Init(void)
      *     之后 ADC 自由运行、DMA 自动循环搬运，**不需要任何定时器触发**，
      *     也不会产生"每次转换一次软件启动"的开销。 */
     st = HAL_ADC_Start_DMA(&hadc3, (uint32_t *)g_adc_dma, ADC_CH_COUNT);
+    s_adc_st = st;                       /* 遥测：0 = HAL_OK，非 0 = 启动失败 */
     configASSERT(st == HAL_OK);
 
     /* ── 第 2 步：零点校准 ────────────────────────────────────────────────
@@ -558,7 +793,7 @@ void OLEDPower_Init(void)
      *
      * ★ 这里绝对不能再建第二次 ★
      * 曾经用 xTaskCreateStatic 建过第二次，于是两个 OLED 任务实例同时在跑，
-     * 而它们共用同一个 I2C1 与同一个 g_i2c1_mutex：两个实例各执行一次
+     * 而它们共用同一个 I2C2 与同一个 g_oled_i2c_mutex：两个实例各执行一次
      * xSemaphoreCreateMutex()（后者覆盖全局句柄）、刷屏互相打断 →
      * 屏幕撕裂、I2C 报错，并且白吃一份 CPU（每次刷屏约 25 ms 阻塞）。
      * 这和 Chassis / Safety / Remote 是同一个 bug，详见 remote.c 的 App_Init()。
@@ -586,8 +821,12 @@ void OLEDPower_Init(void)
 void StartOLEDPower(void *argument)
 {
     TickType_t last_wake;
+    TickType_t last_loop_tick;
     uint32_t divider = 0u;
     const TickType_t period = pdMS_TO_TICKS(OLED_POWER_PERIOD_MS);
+#if (POWER_DEBUG_PRINT != 0)
+    TickType_t last_print_tick;
+#endif
 
     (void)argument;
 
@@ -603,47 +842,61 @@ void StartOLEDPower(void *argument)
      * ⚠ 必须放在阻塞式 I2C 之前，否则还没降下来就被自己卡住。 */
     (void)vTaskPrioritySet(NULL, (UBaseType_t)PRIO_OLEDPOWER);
 
-    /* ── 第 1 步：创建 I2C1 总线互斥锁 ──────────────────────────────────────
+    /* ── 第 1 步：创建 OLED 所在 I2C2 的总线互斥锁 ──────────────────────────
      * 本任务由 CubeMX 的 MX_FREERTOS_Init() 创建（Core/Src/freertos.c 的
      * osThreadNew），此时调度器已经启动，所以走 else 分支；
      * xTaskGetSchedulerState() 的判断保留下来，是为了以后有人把它挪到
-     * 调度器启动之前调用时也不会破坏 heap_4 的空闲链表。 */
+     * 调度器启动之前调用时也不会破坏 heap_4 的空闲链表。
+     *
+     * ⚠ 这把锁保护的是 I2C2（OLED 在 PB10/PB11 上）。
+     *   目前 I2C2 只有 OLED 一个设备（user/sensorimu.c 还是空壳）。
+     *   以后若把 IMU 挂到 I2C2，**必须复用这把锁**，否则两条任务同时访问会互相打断。 */
     if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
         taskENTER_CRITICAL();
-        g_i2c1_mutex = xSemaphoreCreateMutex();
+        g_oled_i2c_mutex = xSemaphoreCreateMutex();
         taskEXIT_CRITICAL();
     } else {
-        g_i2c1_mutex = xSemaphoreCreateMutex();
+        g_oled_i2c_mutex = xSemaphoreCreateMutex();
     }
-    configASSERT(g_i2c1_mutex != NULL);
+    configASSERT(g_oled_i2c_mutex != NULL);
 
-    /* ── 第 2 步：初始化 OLED ──────────────────────────────────────────────
-     * ssd1306_Init() 内部有 HAL_Delay(100) 与几十条 I2C 命令，必须在任务上下文
-     * 里调用（这样调试器能停住，看门狗也能看到这个任务在跑）。整个初始化约
-     * 130 ms，只在启动时发生一次。
+    /* ── 第 2 步：探测 + 初始化 OLED ────────────────────────────────────────
      *
-     * ★ 对其它任务的影响（已核实，结论：无影响）：
-     *   这 130 ms 发生在本任务刚被调度起来的时候，此刻**调度器早已启动**，所以
-     *   它确实会占住 CPU 不让出。但要注意优先级关系：本任务为
-     *   PRIO_OLEDPOWER(35)，Safety(41) / Chassis(47) / SensorImu(38) 都比它高，
-     *   随时可以抢占，因此**底盘速度环与安全任务完全不受影响**；
-     *   唯一被压住的是 Remote 蓝牙解析任务（优先级 26，低于本任务）。
-     *   即使被压住 130 ms，也只是"上电后头一两帧遥控帧晚到 0.13 s"：
-     *   SRM 上游按包头 + CRC 同步，USART2 的 DMA 环形缓冲（256 B）绕回来也
-     *   只会丢帧、不会解析出乱码。所以这是可接受的启动代价。
-     *   （若想彻底消除，把 PRIO_OLEDPOWER 降到 26 以下即可，代价是刷屏更容易
-     *   被蓝牙/遥测任务挤后 —— 但刷屏是 10 Hz 的显示，晚一点毫无影响。） */
-    if (xSemaphoreTake(g_i2c1_mutex, portMAX_DELAY) == pdTRUE) {
-        ssd1306_Init();
-        oled_show_banner();
-        (void)xSemaphoreGive(g_i2c1_mutex);
+     * ★ 先用**有界超时**探测屏在不在（见 s_oled_state 的说明）★
+     *   user/ssd1306/ssd1306.c 里所有 I2C 写都用 HAL_MAX_DELAY（无限超时），
+     *   而 ssd1306_UpdateScreen() 一次 32 笔事务。屏不应答时每笔都等超时，
+     *   一次刷屏实测约 772 ms，会把本任务的 10 ms 采样周期拖成 862 ms
+     *   （遥测里表现为 n 从 449 变成 38715）。
+     *
+     *   所以先探测：不在线就**完全不碰** ssd1306 的那套 API，
+     *   连 ssd1306_Init() 也跳过（它同样会死在 HAL_MAX_DELAY 上）。
+     *   探测本身最多 2 × 5 ms = 10 ms，有界。 */
+    if (HAL_I2C_IsDeviceReady(&SSD1306_I2C_PORT, (uint16_t)SSD1306_I2C_ADDR,
+                              OLED_PROBE_TRIALS, OLED_PROBE_TIMEOUT_MS) != HAL_OK) {
+        s_oled_state = 2u;   /* 离线 */
+        (void)printf("[power] OLED not responding at 0x%02X -> display disabled, "
+                     "sampling stays at %ums\r\n",
+                     (unsigned)(SSD1306_I2C_ADDR >> 1), (unsigned)OLED_POWER_PERIOD_MS);
+    } else {
+        s_oled_state = 1u;   /* 在线 */
+        if (xSemaphoreTake(g_oled_i2c_mutex, portMAX_DELAY) == pdTRUE) {
+            ssd1306_Init();
+            oled_show_banner();
+            (void)xSemaphoreGive(g_oled_i2c_mutex);
+        }
     }
 
     /* 基准时刻必须在"这一轮初始化"之后取，否则 last_wake 会停留在 130 ms 之前，
      * vTaskDelayUntil 会连续追赶十几个周期（表现为起步时刷屏飞快）。 */
     last_wake = xTaskGetTickCount();
+    last_loop_tick = last_wake;
+#if (POWER_DEBUG_PRINT != 0)
+    last_print_tick = last_wake;
+#endif
 
     for (;;) {
+        TickType_t now_tick;
+
         /* ── 10 ms 固定周期 ────────────────────────────────────────────────
          * 用 vTaskDelayUntil 而不是 vTaskDelay：前者以"绝对时刻"为基准，
          * 会把本周期的执行耗时自动扣掉，长期平均周期严格等于 10 ms；
@@ -651,25 +904,157 @@ void StartOLEDPower(void *argument)
          * 严禁使用 HAL_Delay（忙等占住 CPU）。 */
         vTaskDelayUntil(&last_wake, period);
 
+        /* 遥测：本周期相对上一周期的真实间隔。
+         * 正常应恒为 OLED_POWER_PERIOD_MS(10)。若明显更大，
+         * 说明本任务被阻塞了（历史上就是屏不在线时 I2C 无限超时导致的）。 */
+        now_tick = xTaskGetTickCount();
+        s_telem_period_ms = (uint32_t)(now_tick - last_loop_tick);
+        last_loop_tick = now_tick;
+
         /* ① 采集 + 换算 + 滤波 + 电量：只碰内存与 FPU，耗时几十微秒。 */
         power_measurement_update();
+
+#if (POWER_DEBUG_PRINT != 0)
+        /* ── 调试打印（默认 2 Hz）────────────────────────────────────────────
+         * 全部用整数（mV / mA / mW），不触发 printf 的浮点格式化代码。
+         *
+         * 判读：
+         *   adc=0        HAL_ADC_Start_DMA 成功；非 0 则采样根本没启动
+         *   dt=10        本任务循环的真实周期（ms）。**必须接近 10**；
+         *                远大于 10 说明任务被阻塞了（历史上是屏 I2C 无限超时）
+         *   n=449        本周期样本数。44.9 kHz × 10 ms ≈ 449。0 = DMA 停了
+         *   oled=1       1=屏在线在刷屏；2=屏不在线已禁用刷屏（采样周期因此正常）
+         *   dmaV/dmaI    **瞬时**那一轮转换的原始码 —— 判断引脚电平就看这个
+         *   rawV/rawI    本周期均值（原始码），看稳定性
+         *   zero         电流零点（mV），应接近 0
+         *   V/I/P/SOC    换算后的物理量（mV / mA / mW / %）
+         *
+         * 自洽性校验（手动算一遍就能确认换算链没错）：
+         *   V[mV] ≈ rawV / 4095 × 3300 × 11
+         *   例：rawV=1421 → 1421/4095×3300×11 ≈ 12594 mV ≈ 12.59 V ✔
+         *   若 rawV≈0 而 V 也是 0 → **ADC 引脚上确实没有电压**（接线/电池） */
+        if ((TickType_t)(xTaskGetTickCount() - last_print_tick)
+                >= (TickType_t)pdMS_TO_TICKS(POWER_DEBUG_PRINT_PERIOD_MS)) {
+            last_print_tick = xTaskGetTickCount();
+            (void)printf("[power] adc=%d dt=%lu oled=%u n=%lu | "
+                         "dma V=%4lu I=%4lu | raw V=%4lu I=%4lu zero=%ldmV | "
+                         "V=%ldmV I=%ldmA P=%ldmW SOC=%lu%%\r\n",
+                         (int)s_adc_st,
+                         (unsigned long)s_telem_period_ms,
+                         (unsigned)s_oled_state,
+                         (unsigned long)s_telem_n,
+                         (unsigned long)s_telem_dma_v,
+                         (unsigned long)s_telem_dma_i,
+                         (unsigned long)s_telem_raw_v,
+                         (unsigned long)s_telem_raw_i,
+                         (long)(s_zero_offset_v * 1000.0f),
+                         (long)(g_power.battery_v * 1000.0f),
+                         (long)(g_power.current_a * 1000.0f),
+                         (long)(g_power.power_w * 1000.0f),
+                         (unsigned long)g_power.ratio_pct);
+        }
+#endif
 
         /* ② 分频刷屏：10 次 × 10 ms = 100 ms 一帧（10 Hz）。 */
         divider++;
         if (divider >= OLED_REFRESH_DIVIDER) {
             divider = 0u;
 
-            /* 拿 I2C1 总线锁。本工程 IMU 走 I2C2（不是 I2C1），唯一的竞争者
-             * 只有以后新加到 I2C1 上的设备，所以这里正常是"零等待"。
+            /* 拿 I2C2 总线锁。目前 I2C2 上只有 OLED（IMU 尚未实现），
+             * 所以这里正常是"零等待"。
              *
-             * 刻意**不用 portMAX_DELAY**：万一以后有别的任务拿住 I2C1 不放，
-             * 本任务优先级(35)高于 Remote(26)，若无限等待就会连带把蓝牙解析
-             * 一起饿住。限时 200 ms（约 2 帧刷屏周期）后放弃这一帧，
+             * 刻意**不用 portMAX_DELAY**：万一以后有别的任务（比如 IMU）
+             * 拿住 I2C2 不放，本任务优先级最低(20)，若无限等待就会白白占着
+             * 时间片。限时 200 ms（约 2 帧刷屏周期）后放弃这一帧，
              * 下一帧（100 ms 后）自然重试，界面只是偶尔不更新，不会拖垮系统。 */
-            if (xSemaphoreTake(g_i2c1_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            /* 只有屏在线才刷，否则完全不碰 ssd1306 的 HAL_MAX_DELAY 那套 API
+             * （见 s_oled_state 的说明：屏不在线时一次刷屏会拖 772 ms）。 */
+            if ((s_oled_state == 1u) &&
+                (xSemaphoreTake(g_oled_i2c_mutex, pdMS_TO_TICKS(200)) == pdTRUE)) {
                 oled_render();
-                (void)xSemaphoreGive(g_i2c1_mutex);
+                (void)xSemaphoreGive(g_oled_i2c_mutex);
             }
         }
     }
+}
+
+/*============================================================================*/
+/* 遥测接口（只读，调电压/电流采样专用）                                       */
+/*============================================================================*/
+/*
+ * 这组函数只在调试时使用，不参与任何控制计算，也不会被控制路径调用。
+ * 存在的唯一目的：让 Ozone / 串口能读到 OLEDpower.c 内部的 static 量
+ * （原始 ADC 码、零点、样本数、ADC 启动状态），这些量在 Ozone 里直接
+ * 看 static 变量既不可靠（改了布局/名字就失效）也不直观。
+ *
+ * 排障顺序见 OLEDpower.h 里这组声明上方的说明。
+ */
+
+int32_t Power_TelemAdcStatus(void)
+{
+    return (int32_t)s_adc_st;
+}
+
+uint32_t Power_TelemSampleCount(void)
+{
+    return s_telem_n;
+}
+
+uint32_t Power_TelemRawVoltageCode(void)
+{
+    return s_telem_raw_v;
+}
+
+uint32_t Power_TelemRawCurrentCode(void)
+{
+    return s_telem_raw_i;
+}
+
+int32_t Power_TelemZeroOffsetMv(void)
+{
+    float mv = s_zero_offset_v * 1000.0f;
+    return (int32_t)((mv >= 0.0f) ? (mv + 0.5f) : (mv - 0.5f));
+}
+
+int32_t Power_TelemBatteryMv(void)
+{
+    float mv = g_power.battery_v * 1000.0f;
+    return (int32_t)((mv >= 0.0f) ? (mv + 0.5f) : (mv - 0.5f));
+}
+
+int32_t Power_TelemCurrentMa(void)
+{
+    float ma = g_power.current_a * 1000.0f;
+    return (int32_t)((ma >= 0.0f) ? (ma + 0.5f) : (ma - 0.5f));
+}
+
+int32_t Power_TelemPowerMw(void)
+{
+    float mw = g_power.power_w * 1000.0f;
+    return (int32_t)((mw >= 0.0f) ? (mw + 0.5f) : (mw - 0.5f));
+}
+
+uint32_t Power_TelemSocPct(void)
+{
+    return (uint32_t)g_power.ratio_pct;
+}
+
+uint32_t Power_TelemRawDmaVoltageCode(void)
+{
+    return s_telem_dma_v;
+}
+
+uint32_t Power_TelemRawDmaCurrentCode(void)
+{
+    return s_telem_dma_i;
+}
+
+uint32_t Power_TelemLoopPeriodMs(void)
+{
+    return s_telem_period_ms;
+}
+
+uint32_t Power_TelemOledState(void)
+{
+    return (uint32_t)s_oled_state;
 }

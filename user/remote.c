@@ -57,6 +57,38 @@
 #define DEBUG_NO_REMOTE 0
 #endif
 
+/*============================================================================*/
+/* 调试串口输出总开关                                                          */
+/*============================================================================*/
+
+/* ★ REMOTE_DEBUG_PRINT：Remote 任务是否往 USART6 打调试信息 ★
+ *
+ * 1 = 打印（调蓝牙/遥控时用）
+ * 0 = 关闭（**调其它模块时务必设 0**）
+ *
+ * 为什么要能关：
+ *   本任务原本每 500 ms 打一行 `[remote] rx=... online=...`，
+ *   在还没通的时候还会附 32 字节的缓冲十六进制转储 + M0AR/SR 寄存器行。
+ *   而 OLEDpower 模块调电压时同样每 500 ms 打一行 `[power] ...`。
+ *   两路 2 Hz 的输出交织在一起，串口里几乎没法读。
+ *
+ * 关掉之后 USART6 上就只剩其它模块的输出，互不干扰。
+ * 本宏只影响**打印**，协议解析、投队列、online 判定一律照常工作。
+ *
+ * 用法：调电压/底盘/PID 时设 0；回头查蓝牙链路时再设 1。
+ *      也可用编译选项覆盖：-DREMOTE_DEBUG_PRINT=1 */
+#ifndef REMOTE_DEBUG_PRINT
+#define REMOTE_DEBUG_PRINT 0
+#endif
+
+#if (REMOTE_DEBUG_PRINT != 0)
+#define REMOTE_LOG(...)   REMOTE_LOG(__VA_ARGS__)
+#else
+/* 关掉时展开成空语句：参数不会被求值，也就不会产生"变量只写不读"的告警
+ * （相关变量本身也用 #if 一起排除了，见任务体里的说明）。 */
+#define REMOTE_LOG(...)   do { } while (0)
+#endif
+
 #include "chassiscontrol.h"
 #include "debug_uart.h"
 #include "safety.h"
@@ -296,7 +328,7 @@ BaseType_t Remote_ProtocolInit(void) {
      *   地址检查本身在链接脚本确定后不可能失败，保留它是为了兜住
      *   "以后有人给 g_remote 加了 __attribute__((section(".ccmram")))" 这种情况。 */
     if (rx_addr >= CCM_RAM_BASE && rx_addr < CCM_RAM_END) {
-        (void)printf("[remote] INIT FAIL: rx_buffer in CCM RAM (0x%08lX) - DMA cannot access it\r\n",
+        REMOTE_LOG("[remote] INIT FAIL: rx_buffer in CCM RAM (0x%08lX) - DMA cannot access it\r\n",
                      (unsigned long)rx_addr);
         return pdFAIL;
     }
@@ -304,7 +336,7 @@ BaseType_t Remote_ProtocolInit(void) {
     /* ── 运行期检查 2：DMA 缓冲必须落在 SRAM1 地址区间 ────────────────────
      * DMA 控制器访问不到 CCM RAM，但能访问 SRAM1/SRAM2。 */
     if (rx_addr < APP_SRAM1_BASE || rx_addr >= APP_SRAM1_END) {
-        (void)printf("[remote] INIT FAIL: rx_buffer 0x%08lX not in SRAM1 [0x%08lX,0x%08lX)\r\n",
+        REMOTE_LOG("[remote] INIT FAIL: rx_buffer 0x%08lX not in SRAM1 [0x%08lX,0x%08lX)\r\n",
                      (unsigned long)rx_addr,
                      (unsigned long)APP_SRAM1_BASE, (unsigned long)APP_SRAM1_END);
         return pdFAIL;
@@ -356,7 +388,7 @@ BaseType_t Remote_ProtocolInit(void) {
      *   任务继续以 1 ms 周期运行、底盘处于安全态（电机不动），
      *   手机 APP 那边可以先把数据发起来，等串口报告修好后再看效果。 */
     if (g_remote.init_status != HAL_OK) {
-        (void)printf("[remote] INIT FAIL: srm_uart_init status=%d, hdmarx=%p (expect Circular)\r\n",
+        REMOTE_LOG("[remote] INIT FAIL: srm_uart_init status=%d, hdmarx=%p (expect Circular)\r\n",
                      (int)g_remote.init_status, (void *)BT_UART_HANDLE.hdmarx);
         return pdFAIL; /* 队列照常创建，chassis 会一直显示 LOST */
     }
@@ -401,7 +433,7 @@ BaseType_t Remote_ProtocolInit(void) {
     SRM_Remote_Poll(&g_remote);
 
     /* 诊断：确认 DMA 目的地址就是全局数组 g_remote.rx_buffer，且落在 SRAM1 */
-    (void)printf("[remote] DMA armed: buf=0x%08lX (static=%s) ptr_ok=%s restarts=%lu\r\n",
+    REMOTE_LOG("[remote] DMA armed: buf=0x%08lX (static=%s) ptr_ok=%s restarts=%lu\r\n",
                  (unsigned long)(uintptr_t)g_remote.uart.rx_buffer,
                  (((uint32_t)(uintptr_t)g_remote.uart.rx_buffer >= APP_SRAM1_BASE)
                   && ((uint32_t)(uintptr_t)g_remote.uart.rx_buffer < APP_SRAM1_END))
@@ -451,8 +483,10 @@ void StartRemoteTask(void *argument) {
     TickType_t last_wake;
 #if (DEBUG_NO_REMOTE == 0)
     uint8_t link_online;   /* 仅在解析协议时需要记录上一周期在线状态 */
+#if (REMOTE_DEBUG_PRINT != 0)
     uint8_t first_frame_reported;  /* 诊断：第一帧到达时打印一次 */
     TickType_t last_diag_tick;     /* 诊断：字节级统计的节拍 */
+#endif
 #endif
 
     (void)argument;
@@ -461,24 +495,28 @@ void StartRemoteTask(void *argument) {
      * 这两行在 Remote_ProtocolInit() **之前**打印，因此即使协议初始化失败、
      * 甚至卡在里面，只要看到它们就说明任务本身被调度到了。
      * 如果连这两行都看不到，说明任务没被创建/没被调度（与蓝牙完全无关）。 */
-    (void)printf("\r\n[remote] ===== Remote task STARTED (prio=%u) =====\r\n",
+    REMOTE_LOG("\r\n[remote] ===== Remote task STARTED (prio=%u) =====\r\n",
                  (unsigned)PRIO_REMOTE);
 
 #if (DEBUG_NO_REMOTE == 0)
+#if (REMOTE_DEBUG_PRINT != 0)
     first_frame_reported = 0u;
+#endif
     if (Remote_ProtocolInit() != pdPASS) {
-        (void)printf("[remote] SRM_Remote_Init FAILED: check USART2 RX DMA = Circular\r\n");
+        REMOTE_LOG("[remote] SRM_Remote_Init FAILED: check USART2 RX DMA = Circular\r\n");
     } else {
-        (void)printf("[remote] protocol init OK, waiting for frames on USART2 @%lu bps\r\n",
+        REMOTE_LOG("[remote] protocol init OK, waiting for frames on USART2 @%lu bps\r\n",
                      (unsigned long)BT_UART_BAUD);
     }
+#if (REMOTE_DEBUG_PRINT != 0)
     last_diag_tick = xTaskGetTickCount();
+#endif
 #else
     /* 调试旁路：不调用 Remote_ProtocolInit()。
      * g_remote 全零 → init_status == 0(≠HAL_OK) → 下面循环里的
      * SRM_Remote_Poll() 会立刻返回，等价于"遥控链路不存在"，
      * 因此 s_last_cmd 不会被任何人写入。 */
-    (void)printf("[remote] DEBUG_NO_REMOTE=1: protocol init skipped, Ozone drives s_last_cmd\r\n");
+    REMOTE_LOG("[remote] DEBUG_NO_REMOTE=1: protocol init skipped, Ozone drives s_last_cmd\r\n");
 #endif
 
 #if (DEBUG_NO_REMOTE == 0)
@@ -528,25 +566,26 @@ void StartRemoteTask(void *argument) {
         if (need_post != 0u) {
             post_current_frame();
 
+#if (REMOTE_DEBUG_PRINT != 0)
             /* ── 诊断：第一帧到达时打印一次 ──────────────────────────────────
-             * 手机 APP 调试时最想知道的是"板子到底有没有收到数据"。
              * 只打印第一帧，避免 1 kHz 刷屏把串口带宽吃光。
-             * 之后每个帧的数值看 chassiscontrol.c 的 10 Hz 打印即可
-             * （LX/LY/RX/RY/BTN/LT/RT + ON/LOST）。 */
+             * 注意 post_current_frame() 在上一行、**不受本开关影响**。 */
             if (first_frame_reported == 0u) {
                 if (now_online != 0u) {
                     first_frame_reported = 1u;
-                    (void)printf("[remote] FIRST FRAME OK: LX=%d LY=%d RX=%d RY=%d BTN=0x%06lX LT=%u RT=%u\r\n",
-                                 (int)g_last_pro.left_x, (int)g_last_pro.left_y,
-                                 (int)g_last_pro.right_x, (int)g_last_pro.right_y,
-                                 (unsigned long)g_last_pro.buttons,
-                                 (unsigned)g_last_pro.left_trigger,
-                                 (unsigned)g_last_pro.right_trigger);
+                    REMOTE_LOG("[remote] FIRST FRAME OK: LX=%d LY=%d RX=%d RY=%d BTN=0x%06lX LT=%u RT=%u\r\n",
+                               (int)g_last_pro.left_x, (int)g_last_pro.left_y,
+                               (int)g_last_pro.right_x, (int)g_last_pro.right_y,
+                               (unsigned long)g_last_pro.buttons,
+                               (unsigned)g_last_pro.left_trigger,
+                               (unsigned)g_last_pro.right_trigger);
                 }
             }
+#endif /* REMOTE_DEBUG_PRINT */
         }
         link_online = now_online;
 
+#if (REMOTE_DEBUG_PRINT != 0)
         /* ── 字节级 + 数值诊断（每 500 ms 一次，2 Hz，不刷屏）────────────
          * ★ 这是排查"蓝牙连上但 online=0"最有用的一行 ★
          * 它同时回答两个最底层的问题：
@@ -587,7 +626,7 @@ void StartRemoteTask(void *argument) {
                 btn   = (unsigned long)g_last_control.buttons;
             }
 
-            (void)printf("[remote] rx=%lu err=%lu rest=%lu online=%u st=%u pro=%u | "
+            REMOTE_LOG("[remote] rx=%lu err=%lu rest=%lu online=%u st=%u pro=%u | "
                          "AX %4d %4d %4d %4d BTN=0x%06lX\r\n",
                          (unsigned long)g_remote.uart.stats.rx_bytes,
                          (unsigned long)g_remote.uart.stats.uart_errors,
@@ -631,12 +670,12 @@ void StartRemoteTask(void *argument) {
                     uint16_t idx = (uint16_t)((tail + REMOTE_RX_DMA_SIZE - n_show + k)
                                               % REMOTE_RX_DMA_SIZE);
                     if ((k % 16u) == 0u) {
-                        if (k != 0u) (void)printf("\r\n");
-                        (void)printf("[remote] buf[%2u]: ", (unsigned)k);
+                        if (k != 0u) REMOTE_LOG("\r\n");
+                        REMOTE_LOG("[remote] buf[%2u]: ", (unsigned)k);
                     }
-                    (void)printf("%02X ", (unsigned)g_remote.uart.rx_buffer[idx]);
+                    REMOTE_LOG("%02X ", (unsigned)g_remote.uart.rx_buffer[idx]);
                 }
-                (void)printf("| tail=%u ndtr=%u\r\n",
+                REMOTE_LOG("| tail=%u ndtr=%u\r\n",
                              (unsigned)tail, (unsigned)dma_remain);
 
                 /* ── ★决定性检查：DMA 的内存目的地址 M0AR 到底指向哪★ ────────
@@ -666,7 +705,7 @@ void StartRemoteTask(void *argument) {
                      * FE（帧错误）是最重要的信号：
                      *   FE=1 且数据全 0x00  ⇒ **波特率不匹配**（或线路被拉低）。
                      *   这是 MCU 在错误的时刻采样停止位造成的，与 DMA、解析都无关。 */
-                    (void)printf("[remote] M0AR=0x%08lX want=0x%08lX match=%s | "
+                    REMOTE_LOG("[remote] M0AR=0x%08lX want=0x%08lX match=%s | "
                                  "SR=0x%04lX CR1=0x%04lX | %s%s%s%s "
                                  "(RE=%u)\r\n",
                                  (unsigned long)m0ar, (unsigned long)want,
@@ -681,6 +720,7 @@ void StartRemoteTask(void *argument) {
                 }
             }
         }
+#endif /* REMOTE_DEBUG_PRINT */
 #endif /* DEBUG_NO_REMOTE */
 
         /* 3) 固定周期节拍。用 vTaskDelayUntil 而不是 osDelay/HAL_Delay */
