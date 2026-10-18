@@ -48,6 +48,11 @@ void Chassis_TakeLatest(remote_in_t *out) {
     }
 }
 
+/* ★ 三个打印函数整体受 CHASSIS_PRINT_ENABLE 保护 ★
+ * 关闭时连函数体都不编译，避免 -Wunused-function，
+ * 也彻底不占代码空间（printf 的格式化代码会被 --gc-sections 回收）。 */
+#if (CHASSIS_PRINT_ENABLE != 0)
+
 /** @brief 打印遥控原始值（第 1 行）。 */
 static void print_remote_line(const remote_in_t *last) {
     (void)printf("LX=%4d LY=%4d RX=%4d RY=%4d BTN=0x%06lX LT=%3u RT=%3u %s\r\n",
@@ -105,6 +110,14 @@ static void print_enc_line(void) {
                  (long)VelCtl_TelemCountRL(),
                  (long)VelCtl_TelemDutyRL());
 }
+
+#else  /* CHASSIS_PRINT_ENABLE == 0 */
+
+/* 关闭打印：三个函数不编译。任务循环里对应分支也用 #if 去掉了，
+ * 所以不会产生“定义了未使用”的告警。 */
+
+#endif /* CHASSIS_PRINT_ENABLE */
+
 
 /**
   * @brief 执行一次速度环。
@@ -190,13 +203,21 @@ void StartChassisTask(void *argument) {
 
         /* ── 打印降频：10 Hz ───────────────────────────────────────────────
          * 1 kHz 打印会把串口带宽和 CPU 全部吃掉（每行约 90 字节 × 2 行），
-         * 所以每 CHASSIS_PRINT_DIVIDER 个周期打印一次。 */
+         * 所以每 CHASSIS_PRINT_DIVIDER 个周期打印一次。
+         *
+         * ★ 调蓝牙遥控时把 app_config.h 的 CHASSIS_PRINT_ENABLE 设为 0 ★
+         *   否则这 3 行 10 Hz 的打印会把 USART6 占满（约 2700 B/s），
+         *   遥控任务的诊断信息就被冲掉了。 */
+#if (CHASSIS_PRINT_ENABLE != 0)
         if (++print_counter >= CHASSIS_PRINT_DIVIDER) {
             print_counter = 0u;
             print_remote_line(&s_last_cmd);
             print_wheel_line();
             print_enc_line();
         }
+#else
+        (void)print_counter;   /* 关闭打印时避免“变量只写不读”的多余告警 */
+#endif
 
         /* 固定周期节拍：vTaskDelayUntil 以绝对时间为基准，不会累积漂移。
          * 不用 HAL_Delay()：在 FreeRTOS 下它只是忙等 SysTick 计数，

@@ -376,13 +376,6 @@ static int32_t wheel_loop_step(WheelId_e id, float ref_mmps, float dt_s) {
     duty_counts = (int32_t)(duty_frac * (float)MOTOR_PWM_FULL);
 
     /* 直接写原始占空比，**绕过死区补偿**。
-     *
-     * 理由：Motor_ApplyDeadbandComp()（motor_driver.c:130-171）是分段映射，
-     * 在 |duty| = MOTOR_COMP_LINEAR_BAND(=200) 处有跳变：
-     *     desired = 200 → 输出 200
-     *     desired = 201 → 输出 1000 + 201×0.881 ≈ 1177   ← 一步跳 977 个计数！
-     * 这个跳变正好落在 PID 输出围绕 0 微调的区间里，会把小幅调节变成大幅摆动。
-     * 参考项目也是直接把 PWM 计数写进比较寄存器，不做任何补偿。
      * 等基础闭环稳了、要消稳态误差时再加回来。 */
     Motor_SetRawDuty(id, duty_counts);
 

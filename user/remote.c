@@ -54,7 +54,7 @@
  *   守卫完全失效（函数照样被编译进去并触发 -Wunused-function）。
  *   这个坑本文件踩过一次，改动时不要把这段往下挪。 */
 #ifndef DEBUG_NO_REMOTE
-#define DEBUG_NO_REMOTE 1
+#define DEBUG_NO_REMOTE 0
 #endif
 
 #include "chassiscontrol.h"
@@ -194,7 +194,27 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
 //online函数在线置1，超时置0
 #if (DEBUG_NO_REMOTE == 0)
 static uint8_t remote_link_is_online(void) {
-    return ((uint32_t)(xTaskGetTickCount() - (TickType_t)g_remote.last_control_ms)
+    /* ★★★ 必须用 HAL_GetTick()，不能换 xTaskGetTickCount() ★★★
+     *
+     * 上游（Middlewares/Third_Party/SRM/srm_remote.c:78）是这样写时间戳的：
+     *     remote.last_control_ms = HAL_GetTick();
+     * 而本工程用了 Core/Src/stm32f4xx_hal_timebase_tim.c ——
+     * **HAL 的时基被改到 TIM6**（1 kHz），从 HAL_Init() 起就开始计数；
+     * 而 FreeRTOS 的 tick 来自 SysTick，从 osKernelStart() 才开始计数。
+     *
+     * 两者相差 = 从 HAL_Init() 到 osKernelStart() 的全部初始化时间
+     * （外设初始化 + ADC 校准 + OLED 的 HAL_Delay(100) …，实测数百毫秒）。
+     *
+     * 若这里用 xTaskGetTickCount() 去减 last_control_ms，得到的是
+     *     (t_now - t_sched_start) - t_frame = elapsed - t_sched_start
+     * 也就是真实间隔被减掉了整段初始化时间。上电后第一帧到达时 elapsed≈0，
+     * 该值为负 → 按 uint32 处理就是巨大数 → 恒 > 600
+     * → **永远判为 LOST，底盘永远不动，遥控完全不工作**。
+     * 即使初始化时间小于 600 ms 也只是"侥幸"，有效超时被压缩成
+     * 600 ms - 初始化时间，链路会莫名很容易断。
+     *
+     * 所以这里必须与上游**同一个时基**：HAL_GetTick()。 */
+    return ((uint32_t)(HAL_GetTick() - g_remote.last_control_ms)
             <= (uint32_t)REMOTE_TIMEOUT_MS)
                ? 1u
                : 0u;
@@ -263,19 +283,60 @@ BaseType_t Remote_ProtocolInit(void) {
     rx_addr = (uint32_t)(uintptr_t)g_remote.rx_buffer;
 
     /* ── 运行期断言 1：DMA 缓冲绝不能落在 CCM RAM（见 app_config.h 第 8 节）────
-     * DMA 访问 CCM RAM 会静默失败：收不到任何字节且不报任何错。这里用地址范围
-     * 检查把最坏的情况变成一次可定位的 configASSERT。 */
+     * DMA 访问 CCM RAM 会静默失败：收不到任何字节且不报任何错。
+     *
+     * ★ 这里**不用 configASSERT** ★
+     *   本工程的 configASSERT 是 {taskDISABLE_INTERRUPTS(); for(;;);} ——
+     *   会关中断 + 死循环，把 Remote 任务（优先级 26）永久卡死，
+     *   进而让调度器停摆、Chassis 任务（优先级 32）永远得不到执行。
+     *   遥控调试期间最常见的问题恰恰是"蓝牙没接好/波特率不对/DMA 没起来"，
+     *   如果每次都让整机瘫痪，就完全无法定位问题（连串口都停了）。
+     *   所以改成**打印原因 + 返回失败**：底盘照常运行（安全态停车），
+     *   串口和控制台都能看到到底哪一项检查没过。
+     *   地址检查本身在链接脚本确定后不可能失败，保留它是为了兜住
+     *   "以后有人给 g_remote 加了 __attribute__((section(".ccmram")))" 这种情况。 */
     if (rx_addr >= CCM_RAM_BASE && rx_addr < CCM_RAM_END) {
-        configASSERT(0); /* rx_buffer 落在 CCM RAM —— DMA 会静默失效 */
+        (void)printf("[remote] INIT FAIL: rx_buffer in CCM RAM (0x%08lX) - DMA cannot access it\r\n",
+                     (unsigned long)rx_addr);
+        return pdFAIL;
     }
 
-    /* ── 运行期断言 2：DMA 缓冲必须落在 SRAM1 地址区间，且 4 字节对齐 ────── */
+    /* ── 运行期检查 2：DMA 缓冲必须落在 SRAM1 地址区间 ────────────────────
+     * DMA 控制器访问不到 CCM RAM，但能访问 SRAM1/SRAM2。 */
     if (rx_addr < APP_SRAM1_BASE || rx_addr >= APP_SRAM1_END) {
-        configASSERT(0); /* rx_buffer 不在 SRAM1 内（DMA 可能访问不到）*/
+        (void)printf("[remote] INIT FAIL: rx_buffer 0x%08lX not in SRAM1 [0x%08lX,0x%08lX)\r\n",
+                     (unsigned long)rx_addr,
+                     (unsigned long)APP_SRAM1_BASE, (unsigned long)APP_SRAM1_END);
+        return pdFAIL;
     }
-    if ((rx_addr & 0x3u) != 0u) {
-        configASSERT(0); /* rx_buffer 未按 4 字节对齐 */
-    }
+
+    /* ── 运行期检查 3：对齐 —— ★只需要字节对齐，不需要 4 字节★ ─────────────
+     *
+     * ★ 这里曾经要求 4 字节对齐，那是**错的**，而且直接把遥控功能废掉了 ★
+     *
+     * 为什么不需要 4 字节：
+     *   Core/Src/usart.c:142-145 里 USART2_RX 的 DMA 配置是
+     *       .MemDataAlignment = DMA_MDATAALIGN_BYTE   ← 逐字节传输
+     *       .FIFOMode         = DMA_FIFOMODE_DISABLE  ← 没开 FIFO
+     *   逐字节 + 无 FIFO 时，内存地址**只要求 1 字节对齐**，任意字节地址都合法。
+     *   （只有 MEMDATAALIGN_HALFWORD/WORD、或开着 FIFO 才有对齐约束。）
+     *
+     * 而实际地址必然不是 4 的倍数 —— 这是结构体布局决定的：
+     *   srm_remote_t 里 rx_buffer 是第 3 个成员（srm_remote.h:13-24）
+     *       srm_uart_t  uart     @ 0    大小 40
+     *       srm_parser_t parser  @ 40   大小 71（body[68] + state/position/expected）
+     *       uint8_t rx_buffer[]  @ 111  ← 111 % 4 = 3
+     *   所以 g_remote 即使 4 字节对齐，rx_buffer 也必然落在 4n+3。
+     *   实测就是这个地址：0x2000AEFB（& 3 = 3）。
+     *
+     * 后果（本工程真实现象）：
+     *   原来的断言让 Remote_ProtocolInit() 返回 pdFAIL →
+     *   串口打出 "[remote] INIT FAIL: rx_buffer ... not 4-byte aligned" →
+     *   **DMA 从未启动 → rx_bytes 永远是 0 → online 永远是 0**。
+     *   （更早的版本这里是 configASSERT(0)，会直接关中断死循环，整机瘫痪。）
+     *
+     * 现在只做**字节对齐**检查（恒成立，纯属兜底），不再阻止初始化。 */
+    (void)rx_addr;   /* 两个地址检查已经覆盖了必要的合法性；此处保留以示意 */
 
     (void)memset(&g_last_control, 0, sizeof(g_last_control));
     (void)memset(&g_last_pro, 0, sizeof(g_last_pro));
@@ -289,18 +350,65 @@ BaseType_t Remote_ProtocolInit(void) {
      * 之后的字节才会经过 g_remote 的缓冲与解析器。这一行不能省。 */
     g_remote = SRM_Remote_Init(&BT_UART_HANDLE);
 
-    /* ⚠ 不能静默忽略初始化结果：init_status != HAL_OK 说明 DMA 没起来
-     * （常见原因：CubeMX 里 USART2_RX 的 DMA Mode 不是 Circular，或请求被改掉），
-     * 此时收不到任何数据。用 configASSERT 让问题在第一次上电就暴露。
-     * 注意上游返回的是结构体而不是状态码，状态在成员里，因此这里写
-     * “.init_status != HAL_OK”而不是整个返回值。 */
-    configASSERT(g_remote.init_status == HAL_OK);
+    /* ⚠ init_status != HAL_OK 说明 DMA 没起来（常见原因：CubeMX 里 USART2_RX
+     *   的 DMA Mode 不是 Circular，或 hdmarx 为 NULL）。
+     *   **同样不用 configASSERT**（理由见上面的说明）：打印原因并返回失败，
+     *   任务继续以 1 ms 周期运行、底盘处于安全态（电机不动），
+     *   手机 APP 那边可以先把数据发起来，等串口报告修好后再看效果。 */
     if (g_remote.init_status != HAL_OK) {
+        (void)printf("[remote] INIT FAIL: srm_uart_init status=%d, hdmarx=%p (expect Circular)\r\n",
+                     (int)g_remote.init_status, (void *)BT_UART_HANDLE.hdmarx);
         return pdFAIL; /* 队列照常创建，chassis 会一直显示 LOST */
     }
 
-    /* 修正回调上下文并驱动第一轮 poll（此时没有新数据，只是让内部状态一致）。 */
+    /* ★★★★★ 这里必须修补 rx_buffer 指针 ★★★★★
+     *
+     * 上游 SRM_Remote_Init() 是**按值返回**的：
+     *     srm_remote_t SRM_Remote_Init(...) {
+     *         srm_remote_t remote;                          // 栈上局部变量
+     *         srm_uart_init(&remote.uart, uart,
+     *                       remote.rx_buffer,               // 局部副本数组的地址
+     *                       ...);
+     *         return remote;                                // 按值拷贝到 g_remote
+     *     }
+     *
+     * ⚠⚠ 关键在于 srm_uart_t::rx_buffer 是一个**指针**（srm_uart.h:43）：
+     *       srm_uart_init() 里：uart->rx_buffer = rx_buffer;
+     *   所以拷贝到 g_remote 之后，
+     *       g_remote.uart.rx_buffer  ==  SRM_Remote_Init 那个【已失效的栈帧地址】
+     *   而不是 g_remote.rx_buffer（真正的全局数组）。
+     *
+     * 后果（本工程的实测症状）：
+     *   · start_rx_dma() 用这个悬空指针装载 DMA → **DMA 把收到的数据写进死栈帧**
+     *   · srm_uart_poll() 也从同一个悬空指针读（srm_uart.c:46）
+     *   · 死栈帧随后被 printf 等函数调用反复覆盖 →
+     *     表现为 rx_bytes 一直增长（DMA 的 NDTR 确实在变）、
+     *     但缓冲内容恒为 **00 00 00 …**、永远找不到 0xA5 → online 恒为 0。
+     *
+     *   注：只重新装载 DMA **不够** —— 上一版就是拿同一个悬空指针重启的，
+     *       所以依然读不到数据。必须先把指针指回全局数组。
+     *
+     * 必须在调用 SRM_Remote_OnUartError()/Poll() **之前**改好指针，
+     * 这样 start_rx_dma() 拿到的才是 g_remote.rx_buffer。 */
+    g_remote.uart.rx_buffer = g_remote.rx_buffer;
+    g_remote.uart.rx_context = &g_remote;
+
+    /* 然后借用上游自己的重启机制，让 DMA 用**新指针**重新装载：
+     *   SRM_Remote_OnUartError() 只是置 uart.restart_requested = 1；
+     *   下一次 SRM_Remote_Poll() → srm_uart_poll() 看到该标志就执行
+     *   HAL_UART_DMAStop() + start_rx_dma()，此时 uart->rx_buffer 已经正确。 */
+    SRM_Remote_OnUartError(&g_remote, &BT_UART_HANDLE);
     SRM_Remote_Poll(&g_remote);
+
+    /* 诊断：确认 DMA 目的地址就是全局数组 g_remote.rx_buffer，且落在 SRAM1 */
+    (void)printf("[remote] DMA armed: buf=0x%08lX (static=%s) ptr_ok=%s restarts=%lu\r\n",
+                 (unsigned long)(uintptr_t)g_remote.uart.rx_buffer,
+                 (((uint32_t)(uintptr_t)g_remote.uart.rx_buffer >= APP_SRAM1_BASE)
+                  && ((uint32_t)(uintptr_t)g_remote.uart.rx_buffer < APP_SRAM1_END))
+                     ? "SRAM1 ok" : "BAD",
+                 (g_remote.uart.rx_buffer == g_remote.rx_buffer) ? "YES" : "NO",
+                 (unsigned long)g_remote.uart.stats.dma_restarts);
+
     g_frame_valid = 0u;
     return pdPASS;
 }
@@ -343,14 +451,28 @@ void StartRemoteTask(void *argument) {
     TickType_t last_wake;
 #if (DEBUG_NO_REMOTE == 0)
     uint8_t link_online;   /* 仅在解析协议时需要记录上一周期在线状态 */
+    uint8_t first_frame_reported;  /* 诊断：第一帧到达时打印一次 */
+    TickType_t last_diag_tick;     /* 诊断：字节级统计的节拍 */
 #endif
 
     (void)argument;
 
+    /* ── 入口横幅：证明 Remote 任务确实跑起来了 ──────────────────────────
+     * 这两行在 Remote_ProtocolInit() **之前**打印，因此即使协议初始化失败、
+     * 甚至卡在里面，只要看到它们就说明任务本身被调度到了。
+     * 如果连这两行都看不到，说明任务没被创建/没被调度（与蓝牙完全无关）。 */
+    (void)printf("\r\n[remote] ===== Remote task STARTED (prio=%u) =====\r\n",
+                 (unsigned)PRIO_REMOTE);
+
 #if (DEBUG_NO_REMOTE == 0)
+    first_frame_reported = 0u;
     if (Remote_ProtocolInit() != pdPASS) {
         (void)printf("[remote] SRM_Remote_Init FAILED: check USART2 RX DMA = Circular\r\n");
+    } else {
+        (void)printf("[remote] protocol init OK, waiting for frames on USART2 @%lu bps\r\n",
+                     (unsigned long)BT_UART_BAUD);
     }
+    last_diag_tick = xTaskGetTickCount();
 #else
     /* 调试旁路：不调用 Remote_ProtocolInit()。
      * g_remote 全零 → init_status == 0(≠HAL_OK) → 下面循环里的
@@ -405,8 +527,160 @@ void StartRemoteTask(void *argument) {
 
         if (need_post != 0u) {
             post_current_frame();
+
+            /* ── 诊断：第一帧到达时打印一次 ──────────────────────────────────
+             * 手机 APP 调试时最想知道的是"板子到底有没有收到数据"。
+             * 只打印第一帧，避免 1 kHz 刷屏把串口带宽吃光。
+             * 之后每个帧的数值看 chassiscontrol.c 的 10 Hz 打印即可
+             * （LX/LY/RX/RY/BTN/LT/RT + ON/LOST）。 */
+            if (first_frame_reported == 0u) {
+                if (now_online != 0u) {
+                    first_frame_reported = 1u;
+                    (void)printf("[remote] FIRST FRAME OK: LX=%d LY=%d RX=%d RY=%d BTN=0x%06lX LT=%u RT=%u\r\n",
+                                 (int)g_last_pro.left_x, (int)g_last_pro.left_y,
+                                 (int)g_last_pro.right_x, (int)g_last_pro.right_y,
+                                 (unsigned long)g_last_pro.buttons,
+                                 (unsigned)g_last_pro.left_trigger,
+                                 (unsigned)g_last_pro.right_trigger);
+                }
+            }
         }
         link_online = now_online;
+
+        /* ── 字节级 + 数值诊断（每 500 ms 一次，2 Hz，不刷屏）────────────
+         * ★ 这是排查"蓝牙连上但 online=0"最有用的一行 ★
+         * 它同时回答两个最底层的问题：
+         *   ① MCU 的 USART2 到底有没有收到字节         → rx_bytes
+         *   ② 收到的字节有没有被解析成合法控制帧        → online / AX
+         *
+         * rx_bytes 判读：
+         *   = 0        → 一个字节都没到 UART。按顺序查：
+         *                 ① DMA 没起来（看上面的 init OK / DMA armed 行）
+         *                 ② 接线：USART2=PA2(TX)/PA3(RX)，与 JDY-31 **交叉**接
+         *                 ③ 波特率：两边必须一致（本工程 BT_UART_BAUD=9600，
+         *                    若 JDY-31 被 AT 命令改过就要对齐）
+         *                 ④ JDY-31 没把 BLE 数据转发到 UART（模块侧）
+         *   > 0 但不变  → 字节偶尔来，但不成流
+         *   > 0 且持续增长：
+         *       online=1 → 链路正常，看 AX 的数值调 APP
+         *       online=0 → 字节在进但解析不出帧：波特率不对（乱码→CRC 全失败）
+         *                  或 APP 发的不是 SRM v4 帧
+         *
+         * AX 是解析后的摇杆原始量纲（-512..511）+ 按键位图，
+         * 与底盘打印的 LX/LY/RX/RY/BTN 完全同源，用来直接调 APP 的映射。 */
+        if ((TickType_t)(xTaskGetTickCount() - last_diag_tick) >= (TickType_t)500u) {
+            int ax_lx, ax_ly, ax_rx, ax_ry;
+            unsigned long btn;
+            unsigned is_pro;
+
+            last_diag_tick = xTaskGetTickCount();
+
+            /* 按当前数据源取快照（PRO_CONTROL 还是传统 CONTROL）。 */
+            is_pro = (unsigned)g_frame_is_pro;
+            if (g_frame_is_pro != 0u) {
+                ax_lx = (int)g_last_pro.left_x;   ax_ly = (int)g_last_pro.left_y;
+                ax_rx = (int)g_last_pro.right_x;  ax_ry = (int)g_last_pro.right_y;
+                btn   = (unsigned long)g_last_pro.buttons;
+            } else {
+                ax_lx = (int)g_last_control.left_x;   ax_ly = (int)g_last_control.left_y;
+                ax_rx = (int)g_last_control.right_x;  ax_ry = (int)g_last_control.right_y;
+                btn   = (unsigned long)g_last_control.buttons;
+            }
+
+            (void)printf("[remote] rx=%lu err=%lu rest=%lu online=%u st=%u pro=%u | "
+                         "AX %4d %4d %4d %4d BTN=0x%06lX\r\n",
+                         (unsigned long)g_remote.uart.stats.rx_bytes,
+                         (unsigned long)g_remote.uart.stats.uart_errors,
+                         (unsigned long)g_remote.uart.stats.dma_restarts,
+                         (unsigned)now_online,
+                         (unsigned)g_remote.parser.state,
+                         is_pro,
+                         ax_lx, ax_ly, ax_rx, ax_ry, btn);
+
+            /* ── ★原始字节转储★（只在还没解析出帧时打印，通了就不再打）──────
+             *
+             * 为什么需要它：当 rx 一直在涨但 online 一直是 0 时，靠上层状态
+             * 无法区分"CRC 错"、"版本不是 4"、"根本不是 SRM 帧"这三种情况。
+             * 直接把 DMA 环形缓冲里的字节按十六进制打出来，一眼就能看出
+             * APP 到底在发什么。
+             *
+             * ★ 取样位置用 rx_tail，而不是 DMA 当前写指针 ★
+             *   rx_tail 是 srm_uart_poll() 已经消费到的位置 —— 它之前的 32 个
+             *   字节**确定已经被 DMA 写过**。而 DMA 写指针之前的区域在
+             *   刚重启动 DMA 时可能是从未写过的全 0，会造成误判。
+             *
+             * 判读（SRM v4 一帧的线格式）：
+             *     A5 5A | VTYPE | SEQ | LEN | payload... | CRC
+             *   VTYPE 高 4 位必须是 4，所以第 3 个字节应该是 0x4X
+             *   （CONTROL → 0x40，PRO_CONTROL → 0x47，HELLO → 0x41）
+             *
+             *   · A5 5A 47 / A5 5A 40 → 帧格式对，问题在 CRC 或后续字段
+             *   · A5 5A 但不是 4X      → APP 的协议版本不是 v4
+             *   · 看不到 A5 5A         → 波特率不对（乱码）或 APP 发的不是 SRM 帧
+             *   · 全是 00              → 收到的确实是全零字节（模块侧或 APP 没发数据）
+             *   · 全是 FF              → 线路悬空 / TX 没接 */
+            if (now_online == 0u) {
+                const uint16_t n_show = 32u;
+                uint16_t tail = g_remote.uart.rx_tail;
+                uint16_t k;
+                uint16_t dma_remain;
+
+                dma_remain = (uint16_t)__HAL_DMA_GET_COUNTER(g_remote.uart.handle->hdmarx);
+
+                for (k = 0u; k < n_show; k++) {
+                    uint16_t idx = (uint16_t)((tail + REMOTE_RX_DMA_SIZE - n_show + k)
+                                              % REMOTE_RX_DMA_SIZE);
+                    if ((k % 16u) == 0u) {
+                        if (k != 0u) (void)printf("\r\n");
+                        (void)printf("[remote] buf[%2u]: ", (unsigned)k);
+                    }
+                    (void)printf("%02X ", (unsigned)g_remote.uart.rx_buffer[idx]);
+                }
+                (void)printf("| tail=%u ndtr=%u\r\n",
+                             (unsigned)tail, (unsigned)dma_remain);
+
+                /* ── ★决定性检查：DMA 的内存目的地址 M0AR 到底指向哪★ ────────
+                 *
+                 * 现象是：tail 和 ndtr 都在推进（DMA 确实在传输），
+                 *         但 g_remote.rx_buffer 一个字节都没被写过（保持 BSS 全零）。
+                 *
+                 * 这只有两种可能：
+                 *   ① DMA 的 M0AR 指向别处（还是那个失效栈地址）→ 缓冲永远全零
+                 *   ② M0AR 是对的，那么收到的字节**本身就是 0x00**
+                 *
+                 * 读 M0AR 就能一刀切开：
+                 *   m0ar == want  → DMA 正在写这个缓冲 ⇒ 收到的数据真的是全零
+                 *   m0ar != want  → DMA 写别处       ⇒ 指针/重装载没生效
+                 *
+                 * 同时打印 USART2 的 SR 与 CR1：
+                 *   SR 的 ORE(bit3)/NE(bit2)/FE(bit1)/IDLE(bit4) 能看出
+                 *   是不是线路异常（全零 + FE 置位 = 线路一直被拉低）；
+                 *   CR1 的 RE(bit2) 必须为 1，否则接收器根本没开。 */
+                {
+                    uint32_t m0ar = (uint32_t)BT_UART_HANDLE.hdmarx->Instance->M0AR;
+                    uint32_t want = (uint32_t)(uintptr_t)g_remote.rx_buffer;
+                    uint32_t sr   = (uint32_t)BT_UART_HANDLE.Instance->SR;
+                    uint32_t cr1  = (uint32_t)BT_UART_HANDLE.Instance->CR1;
+
+                    /* 把 SR 的错误位解成文本，省得再查手册。
+                     * FE（帧错误）是最重要的信号：
+                     *   FE=1 且数据全 0x00  ⇒ **波特率不匹配**（或线路被拉低）。
+                     *   这是 MCU 在错误的时刻采样停止位造成的，与 DMA、解析都无关。 */
+                    (void)printf("[remote] M0AR=0x%08lX want=0x%08lX match=%s | "
+                                 "SR=0x%04lX CR1=0x%04lX | %s%s%s%s "
+                                 "(RE=%u)\r\n",
+                                 (unsigned long)m0ar, (unsigned long)want,
+                                 (m0ar == want) ? "YES" : "NO!!",
+                                 (unsigned long)(sr & 0xFFFFu),
+                                 (unsigned long)(cr1 & 0xFFFFu),
+                                 ((sr & (1u << 1)) != 0u) ? "FE " : "",
+                                 ((sr & (1u << 2)) != 0u) ? "NE " : "",
+                                 ((sr & (1u << 3)) != 0u) ? "ORE " : "",
+                                 ((sr & (1u << 4)) != 0u) ? "IDLE " : "",
+                                 (unsigned)((cr1 >> 2) & 1u));
+                }
+            }
+        }
 #endif /* DEBUG_NO_REMOTE */
 
         /* 3) 固定周期节拍。用 vTaskDelayUntil 而不是 osDelay/HAL_Delay */

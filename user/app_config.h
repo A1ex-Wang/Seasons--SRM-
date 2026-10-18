@@ -63,8 +63,30 @@
 /* 2. 蓝牙链路（JDY-31 透传模块，接 USART2）                                   */
 /*============================================================================*/
 
-/* 蓝牙模块波特率。必须与 Robo.ioc 里 USART2.BaudRate 一致，否则收到的是乱码，
- * 现象是“一个合法帧都解析不出来”。上游 SRM 代码本身与波特率无关。 */
+/* 蓝牙模块（JDY-31）的 UART 波特率。
+ *
+ * ★★★ 这是**唯一真值来源**，改这里就够了 ★★★
+ *   Core/Src/usart.c 的 USER CODE 区会在 MX_USART2_UART_Init() 末尾
+ *   强制把 huart2 的波特率与 BRR 对齐到本宏：
+ *       if (huart2.Init.BaudRate != BT_UART_BAUD) {
+ *           huart2.Init.BaudRate = BT_UART_BAUD;
+ *           huart2.Instance->BRR = ...;
+ *       }
+ *   所以在 CubeMX 里改 USART2.BaudRate、或直接改 usart.c:46 的 115200，
+ *   **都会被这里拉回来**。要改波特率只能改这个宏。
+ *
+ * ★ 必须与 JDY-31 模块自己的 UART 波特率一致，否则收到的全是乱码 ★
+ *   JDY-31 出厂默认 9600。SRM 参考固件（stm32f103_hal）与 SRM 库注释
+ *   （srm_uart.h:18「115200 bps 下 256 字节…」）都按 115200 设计。
+ *
+ *   两种情况二选一，**两边必须同时是同一个值**：
+ *     A) 模块保持出厂 9600        → 本宏写 9600u
+ *     B) 模块用 AT 命令改成 115200 → 本宏写 115200u
+ *
+ *   用 AT 命令把 JDY-31 改成 115200 的方法（USB 转串口接模块，9600 8N1 进入）：
+ *       AT+BAUD8        （8 = 115200；具体编号以模块手册为准）
+ *       或 AT+BAUD=115200
+ *   改完后模块重新上电，之后必须用 115200 与它通信。 */
 #define BT_UART_BAUD 9600u
 
 /* 蓝牙串口句柄：CubeMX 在 Core/Src/usart.c 中生成，C 文件里的变量名固定。 */
@@ -106,6 +128,25 @@
 /* 打印降频：每 N 个 Chassis 周期（1 ms）打印一次 = 10 Hz。
  * 不做内容去重的话，1 kHz 打印会把串口和 CPU 全部吃掉。 */
 #define CHASSIS_PRINT_DIVIDER 100u
+
+/* ★★★ 底盘任务串口打印总开关 ★★★
+ *
+ * 1 = 打印（正常调试底盘/PID 时用）
+ * 0 = 关闭（**调蓝牙遥控时务必设 0**）
+ *
+ * 为什么调遥控时必须关：
+ *   底盘的 3 行打印是 10 Hz、每轮约 270 字节，占用串口约 2700 B/s；
+ *   而遥控任务的诊断信息只有 0.5 Hz、每行约 80 字节。
+ *   两者共用同一个 printf → USART6（见 debug_uart.c 的重定向链路），
+ *   底盘把带宽占满之后，遥控那几行（尤其是**开机只打一次**的
+ *   `[remote] protocol init OK`）会被冲掉或者错过，
+ *   表现为"看不到 remote 任务的串口输出"。
+ *
+ *   另外 printf 在 DebugUart_PutChar() 里是**阻塞等 TXE** 的：
+ *   底盘一次打 3 行约占用 23 ms/100 ms，而 Chassis 优先级(32) 高于
+ *   Remote(26)，所以这段时间遥控任务完全得不到执行，
+ *   SRM_Remote_Poll() 也被推迟 —— 调蓝牙时更需要让出带宽和 CPU。 */
+#define CHASSIS_PRINT_ENABLE 0u
 
 /*============================================================================*/
 /* 5. 失联保护                                                                */
@@ -224,10 +265,10 @@
  * 想让它动，先把编码器接上再把对应的宏改成 1。
  *
  * 当前状态：只接了 M3（= RL）的编码器反馈，其余三轮保持 0。 */
-#define VEL_USE_FB_FL 0u  /* M1 编码器：未接 → 不输出 */
-#define VEL_USE_FB_FR 0u  /* M2 编码器：未接 → 不输出 */
+#define VEL_USE_FB_FL 1u  /* M1 编码器：未接 → 不输出 */
+#define VEL_USE_FB_FR 1u  /* M2 编码器：未接 → 不输出 */
 #define VEL_USE_FB_RL 1u  /* M3 编码器：已接 → 闭环（当前唯一在调的轮子） */
-#define VEL_USE_FB_RR 0u  /* M4 编码器：未接 → 不输出 */
+#define VEL_USE_FB_RR 1u  /* M4 编码器：未接 → 不输出 */
 
 /*============================================================================*/
 /* 8. 运动学与整定参数                                                        */
@@ -307,14 +348,14 @@
  *   注意：这里说的"为正"是 relative 该轮的物理前进方向，不是车体前进方向 ——
  *   麦轮直行时左右两侧轮子的物理转向本来就相反，那是由运动学的目标值符号
  *   区分的（见 velocity_control.c 的 mecanum_inverse），与本组标定宏无关。 */
-#define MOTOR_SIGN_DIR_FL (1)
+#define MOTOR_SIGN_DIR_FL (-1)
 #define MOTOR_SIGN_PWM_FL (1)
 #define MOTOR_SIGN_ENC_FL (1)   /* 曾经是 -1，与 PWM_FL=+1 反号 → 正反馈震荡，已修正 */
 #define MOTOR_DEADBAND_FL 1000u
 
 #define MOTOR_SIGN_DIR_FR (1)
 #define MOTOR_SIGN_PWM_FR (1)
-#define MOTOR_SIGN_ENC_FR (1)
+#define MOTOR_SIGN_ENC_FR (-1)
 #define MOTOR_DEADBAND_FR 1000u
 
 #define MOTOR_SIGN_DIR_RL (-1)
@@ -322,9 +363,9 @@
 #define MOTOR_SIGN_ENC_RL (-1)
 #define MOTOR_DEADBAND_RL 1000u
 
-#define MOTOR_SIGN_DIR_RR (1)
+#define MOTOR_SIGN_DIR_RR (-1)
 #define MOTOR_SIGN_PWM_RR (1)
-#define MOTOR_SIGN_ENC_RR (1)
+#define MOTOR_SIGN_ENC_RR (-1)
 #define MOTOR_DEADBAND_RR 1000u
 
 /* 开环标定模式：置 1 后速度环停摆，四个轮子直接吃由摇杆调制的固定占空比，
