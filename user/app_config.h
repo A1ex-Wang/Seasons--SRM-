@@ -525,107 +525,56 @@ APP_STATIC_ASSERT((MOTOR_DEADBAND_RR < MOTOR_PWM_FULL), "MOTOR_DEADBAND_RR out o
 /* 14. 电池功率与电量监控（ADC3 + INA240A1 + SSD1306）                          */
 /*============================================================================*/
 
-/* 本节全部是 OLED 数显模块（user/OLEDpower.c）的编译期参数。
- * 与第 1~13 节的底盘/遥控参数完全无关，改动本节不会影响运动学、速度环、
- * 编码器或蓝牙协议解析。 */
-
-/* 硬件链条（已实测确认；换硬件时只改本节前面几个宏，算法不用动）：
+/* PF3/ADC3_IN9 电流：1 mΩ + INA240A1，REF 接地；PF4/ADC3_IN14 电压：11:1 分压。
+ * 接线与电阻公差须以实物为准。电压、电流和功率分别与仪表比较后再调比例。
+ * 当前固定零点默认 0 V，默认不扣除上电负载。只有真实零电流时才可启动零点校准；
+ * 标定使用实际样本数，成功后把零点电压写入 POWER_CURRENT_ZERO_V 持久化。
+ * current = (Vadc - zero) / (Rshunt * gain) * POWER_CURRENT_GAIN_CORRECTION。
+ * ADC 参考电压误差会同时影响电压和电流，功率是二者乘积，须独立验收。
  *
- *   电池 ──[1 mΩ 采样电阻]── 负载
- *              │
- *         INA240A1（增益 20 V/V，REF1 = REF2 = GND → **单向**检测）
- *              │  输出 0 V(0 A) … 3.3 V(165 A)，零点无偏置
- *           PF3 = ADC3_IN9      → 电流通道（规则组 rank1）
+ * ADC DMA 连续采样，测量任务 10 ms；独立 OLED 任务每帧后等待 200 ms。
+ * OLED 通信有有限超时、整帧首错停止及离线重试；不在测量任务中刷屏/打印。
+ * 采样超过 100 ms 未更新则显示 ADC ERROR，保留数值仅供诊断，不作为有效数据。
  *
- *   电池 ──[100 kΩ ±5%]──┬──[10 kΩ ±1%]── GND
- *                        │
- *                    PF4 = ADC3_IN14 → 电压通道（规则组 rank2，分压比 11 : 1）
- *
- * ★ REF 接地带来的三个后果（与常见 VCC/2 双向接法不同，务必理解）：
- *   1) 零电流时运放输出 ≈ 0 V，不是 1.65 V，所以电流**恒为非负**；
- *      代码仍按带符号处理并做下限幅；
- *   2) 运放输出贴近地轨时线性度变差（输出下限约 10 mV → 折合 0.5 A），
- *      因此 0.5 A 以下不保证精度，也不参与电量更新；
- *   3) 满量程 = 3.3 V / 0.02 V/A = 165 A，远超实际电流，无饱和风险。 */
+ * SOC 仍为配置电压端点之间的粗估，不擅自选择电池化学体系的曲线。
+ * 电流幅值 < 0.5 A 且电压在 0.05 V 范围内稳定 3 s 后才更新；
+ * 首次取得有效 SOC 后，每 5 s 最多变动 1 个百分点。持续高负载时可能保持旧值。
+ * 低电压告警独立延时/滞回，默认 10.5 V 报警、10.8 V 解除，非硬件保护。
+ * 若静态负载本身超过 0.5 A，必须先实测再决定 SOC 休息判据，不能盲目提高阈值。
+ * 两个任务均低于 Remote/Chassis；I2C2 新增设备必须共用互斥锁。
+ */
 
-#define POWER_SHUNT_OHM 0.001f /* 采样电阻 1 mΩ（硬件不可改，已确认） */
-#define POWER_AMP_GAIN 20.0f   /* INA240A1 增益 20 V/V */
-/* 采样电阻 + 运放合并后的转换系数：I[A] = (V_adc − V_zero) / POWER_AMPS_TO_VOLTS */
-#define POWER_AMPS_TO_VOLTS (POWER_SHUNT_OHM * POWER_AMP_GAIN) /* = 0.02 V/A */
-
-/* 1 = 双向（REF 接 VCC/2），0 = 单向（REF 接 GND，本工程当前硬件）。
- * 置 0 时负电流被限幅到 POWER_CURRENT_FLOOR_A。 */
+#define POWER_SHUNT_OHM 0.001f
+#define POWER_AMP_GAIN 20.0f
+#define POWER_AMPS_TO_VOLTS (POWER_SHUNT_OHM * POWER_AMP_GAIN)
 #define POWER_CURRENT_BIDIRECTIONAL 0
-
-/* 分压比 = (100k + 10k) / 10k = 11.0。
- * ⚠ 精度提醒：100 kΩ 是 ±5%、10 kΩ 是 ±1%，最坏情况下分压比落在 10.52…11.61
- * （约 ±5.5% 误差），已经吃掉一半的 ±10% 指标预算。后续实测修正时直接改这个
- * 数字（例如实测比值 11.08 就写 11.08f），不要改公式。 */
 #define POWER_DIVIDER_RATIO 11.0f
-
-/* ADC 参考电压。暂按 3.3 V；实测 VREF+ 后改成实测值（例如 3.287f）。
- * 它是全链路的比例因子，偏 3% 则电压/电流/功率一起偏 3%。 */
 #define POWER_ADC_VREF 3.3f
-#define POWER_ADC_FULL_SCALE 4095.0f /* 12 位，右对齐 */
-
-/* 电流下限（A）。单向检测没有负电流，低于 0 一律归零。 */
+#define POWER_ADC_FULL_SCALE 4095.0f
 #define POWER_CURRENT_FLOOR_A 0.0f
-
-/* 零点校准采样次数：在调度器启动前（PWM 从未输出过，物理上必然零电流）
- * 连续采样求平均赋给 zero_offset_v。100 次求平均把量化噪声压到 0.1 LSB 量级。 */
 #define POWER_ZERO_CAL_SAMPLES 100u
-
-/* 过采样窗长（ms）。ADC3 在 DMA 循环模式下自由运行，采样率由 adc.c 的配置决定：
- *     f_ADCCLK = PCLK2 / 6 = 84 MHz / 6 = 14 MHz
- *     单通道转换 = 144(采样) + 12(12 位逐次逼近) = 156 个 ADC 周期 ≈ 11.1 µs
- *     一轮扫描 = 2 个通道 ≈ 22.3 µs  →  **约 45 kHz**，DMA 完成中断同频
- * 也就是说 10 ms 窗内约有 450 轮转换（900 个采样点）。
- * DMA 完成中断里只做整数累加、不做任何浮点，任务每 10 ms 取一次均值，
- * 量化噪声按 √450 ≈ 21 倍下降 —— 这是把「1 LSB = 40 mA」这个硬分辨率救回来的
- * 关键手段，也是守住 ±10% 的必要条件。 */
+#define POWER_ZERO_CAL_AT_BOOT 0u
+#define POWER_CURRENT_ZERO_V 0.0f
+#define POWER_CURRENT_GAIN_CORRECTION 1.0f
+#define POWER_ZERO_CAL_WINDOW_MS 200u
+#define POWER_SAMPLE_STALE_MS 100u
+#define POWER_SOC_REST_MS 3000u
+#define POWER_SOC_STEP_MS 5000u
+#define POWER_SOC_STABLE_BAND_V 0.05f
+#define POWER_LOW_VOLTAGE_V POWER_V_EMPTY
+#define POWER_LOW_VOLTAGE_CLEAR_V (POWER_V_EMPTY + 0.3f)
+#define POWER_LOW_VOLTAGE_HOLD_MS 1000u
+#define POWER_MEASURE_PRIORITY (PRIO_OLEDPOWER + 1u)
+#define OLED_REFRESH_PERIOD_MS 200u
+#define OLED_RETRY_PERIOD_MS 1000u
+#define OLED_I2C_LOCK_TIMEOUT_MS 5u
 #define POWER_SAMPLE_PERIOD_MS 10u
-
-/* 一阶低通「守旧系数」（0~1，越大越平滑）。等价时间常数：
- *     τ = dt × alpha / (1 − alpha)，alpha = 0.90、dt = 10 ms → τ ≈ 90 ms
- * 注意 dt 是 10 ms，所以 τ 是**毫秒**量级，不是"90 秒"。
- * alpha 再往上加（0.99 → τ ≈ 1 s）会让电量显示严重滞后，不建议。 */
 #define POWER_LPF_ALPHA 0.90f
-
-/* 电量百分比映射端点（3S 锂电池：满 12.6 V / 空 10.5 V）。
- * ⚠ 这是很粗的模型：锂电放电曲线中段平坦，线性映射误差远大于显示精度，
- * 它只能当"还能不能跑"的粗略指示，不是真实 SOC。要更准需库仑积分或分段查表。 */
 #define POWER_V_FULL 12.6f
 #define POWER_V_EMPTY 10.5f
-
-/* 只有在电流小于该值时才更新电量百分比：急加速时电池被拉低，
- * 此时若更新，电量会跟着油门一起狂掉。0.5 A 同时是运放近地轨的精度下限。 */
 #define POWER_SOC_UPDATE_MAX_A 0.5f
-
-/* ── OLED 任务参数 ────────────────────────────────────────────────────────── */
-#define OLED_POWER_PERIOD_MS POWER_SAMPLE_PERIOD_MS /* 10 ms 严格周期 */
-
-/* 刷屏分频：10 次 × 10 ms = 100 ms 刷一次（10 Hz）。
- * ★ 分频改变不了"那一次刷屏"的耗时：ssd1306_UpdateScreen() 要在 400 kHz 下
- *   发 1024 字节数据 + 24 字节命令，实测约 25 ms 阻塞。期间 vTaskDelayUntil
- *   会顺延 2~3 个 tick。这是把 I2C 屏塞进 10 ms 任务的固有代价，换来的是
- *   "不丢采样"——采样由 DMA + 中断累加，任务晚一点取均值不影响结果。 */
-#define OLED_REFRESH_DIVIDER 10u
-
-/* 任务栈（字）与优先级。任务用 xTaskCreateStatic 静态创建（不占 FreeRTOS heap）。
- *
- * ★ PRIO_OLEDPOWER 由本节统一规定，是**全系统最低**的优先级。
- *   原因（踩过的坑）：OLED 任务里有两处会长时间占住 CPU，必须让它们随时能被
- *   底盘任务抢占：
- *     1) StartOLEDPower 启动时调用 ssd1306_Init()，内部是**阻塞式**
- *        HAL_I2C_Mem_Write，超时参数是 HAL_MAX_DELAY —— OLED 没接好/不响应
- *        时会一直等 I2C；
- *     2) 每 100 ms 一次 oled_render()，同样是阻塞 I2C。
- *   一旦 OLED 优先级高于 Chassis，上面任一处卡住就会把速度环彻底饿死：
- *   现象是"串口完全没输出、s_vel_tick 停住不动、电机不动"，而 Safety 任务
- *   因为优先级更高仍在喂狗，所以**看门狗也不会复位**，故障表现得非常隐蔽。
- *
- *   定义只在下面这一处，数值见第 1 节（PRIO_OLEDPOWER = 20）。
- *   注意"数值越大优先级越高"：20 低于 Remote(26)，因此 OLED 不会挡住任何任务。 */
+#define OLED_POWER_PERIOD_MS POWER_SAMPLE_PERIOD_MS
+#define OLED_REFRESH_DIVIDER (OLED_REFRESH_PERIOD_MS / POWER_SAMPLE_PERIOD_MS)
 #define STACK_OLEDPOWER_WORDS 768u
 #define NAME_OLEDPOWER "OLEDPower"
 

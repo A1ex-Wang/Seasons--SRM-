@@ -166,6 +166,9 @@ typedef struct {
 
 // Procedure definitions
 void ssd1306_Init(void);
+/* 调用者在整帧/初始化前清错；首个失败后，本帧后续写入自动跳过。 */
+void ssd1306_ClearError(void);
+HAL_StatusTypeDef ssd1306_GetStatus(void);
 void ssd1306_Fill(SSD1306_COLOR color);
 void ssd1306_UpdateScreen(void);
 void ssd1306_DrawPixel(uint8_t x, uint8_t y, SSD1306_COLOR color);
