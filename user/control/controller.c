@@ -10,16 +10,8 @@
   *   现象是“车冲出去并剧烈振荡”，而代码看起来完全正常。
   *   下面有运行期保护把 dt_s 限制在合理区间，但请仍然按约定传值。
   *
-  * ★ 相对原版做的 4 处行为修正（都是本工程实车会踩到的）★
-  *   1) dt_s 合法性保护：超出 (0, PID_DT_MAX_S] 直接返回 0，不再参与计算，
-  *      避免一次调度抖动把 I 项炸掉；
-  *   2) DeadBand 分支不再把 Output 直接清零：原版在 |Err| <= DeadBand 时
-  *      Output = 0，用于位置环没问题，但速度环会造成“到了目标就断输出、
-  *      掉速后再猛给”的极限环抖动。改为：保持当前输出、清零积分增量，
-  *      并且额外支持 **死区内输出限幅**（更符合“不要抖”的诉求）；
-  *   3) 抗积分饱和改成“**只要输出饱和就不积分**”（原版只在误差还朝饱和方向
-  *      增大时才阻止积分，误差已经反向但输出仍饱和时会继续堆积）；
-  *   4) Iout 的限幅移到所有分支之外无条件执行，避免 DeadBand 分支绕过限幅。
+  * 速度环相关行为：dt_s 非法时保持输出；DeadBand > 0 时才启用误差死区。
+  * 总输出包含前馈，饱和时禁止加深饱和的积分，但允许反向释放积分。
   ******************************************************************************
   */
 
@@ -116,8 +108,8 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref, float dt_s) {
      * 与原版的区别：不动 Output、不动 Iout，只是不再累积新的积分。
      * 这样“误差进入死区”时输出保持在上一次的值，电机不会被突然断输出，
      * 也就不会出现“断输出→掉速→误差变大→再给输出”的极限环。
-     * 如果调用方希望死区内慢慢松输出，把 DeadBand 设 0 即可。 */
-    if (fabsf(pid->Err) <= pid->DeadBand) {
+     * DeadBand = 0 时禁用本分支，误差恰好为零也重新合成输出及前馈。 */
+    if (pid->DeadBand > 0.0f && fabsf(pid->Err) <= pid->DeadBand) {
         pid->ITerm = 0.0f;
         pid->Last_Measure = pid->Measure;
         pid->Last_Err = pid->Err;
@@ -173,12 +165,11 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref, float dt_s) {
      * 注意分母：candidate_output 是"P+I+D"三项之和，加前馈后才是真正写入执行器的量。 */
     candidate_output = pid->Pout + candidate_i + pid->Dout + pid->FeedForward;
 
-    /* ── 抗积分饱和 ────────────────────────────────────────────────────────
-     * 判据是"含前馈的总输出将要饱和就冻结本次积分"，不再要求误差方向一致。
-     * 原因：误差刚反向、但输出还压在饱和值时（例如堵转刚解除），
-     * 原判据会继续累积积分，等误差真正反向后要靠很久才能把积分放掉，
-     * 表现为“冲一下再回来”。 */
-    if ((candidate_output > pid->MaxOut) || (candidate_output < -pid->MaxOut)) {
+    /* 含前馈的总输出饱和时，只阻止继续加深饱和的积分增量。
+     * 允许反向积分释放已有积累，避免饱和后积分始终无法恢复。
+     * 用实际增量判断，兼容积分限幅、梯形积分和冻结积分。 */
+    if (((candidate_output > pid->MaxOut) && (candidate_i > pid->Iout)) ||
+        ((candidate_output < -pid->MaxOut) && (candidate_i < pid->Iout))) {
         candidate_i = pid->Iout;
     }
     pid->Iout = candidate_i;

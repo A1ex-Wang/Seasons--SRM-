@@ -62,6 +62,37 @@ extern TIM_HandleTypeDef htim4;
 static Encode_t s_enc[WHEEL_COUNT];
 static PIDInstance s_pid[WHEEL_COUNT];
 
+#if (MOTOR_TEST_MODE == 0)
+/* 速度环补偿参数：不改遥控、运动学、编码器和驱动层。
+ * kV 单位为占空比分数/(mm/s)，kS 为占空比分数。
+ * 以下由现有最大轮速和死区估算，尚非负载实测值。
+ * 后续可分别标定每轮正反转；令对应 kV/kS 为 0 可独立关闭该项。
+ * kV = (u2-u1)/(v2-v1)，kS = u1-kV*v1（同方向稳态样本）。 */
+typedef struct {
+    float kv_positive;
+    float kv_negative;
+    float ks_positive;
+    float ks_negative;
+} wheel_ff_config_t;
+
+#define VEL_FF_INITIAL_KS(deadband) ((float)(deadband) / (float)MOTOR_PWM_FULL)
+#define VEL_FF_INITIAL_KV(deadband) ((1.0f - VEL_FF_INITIAL_KS(deadband)) / WHEEL_MAX_SPEED_MMPS)
+#define VEL_FF_INITIAL(deadband) {VEL_FF_INITIAL_KV(deadband), VEL_FF_INITIAL_KV(deadband), \
+                                  VEL_FF_INITIAL_KS(deadband), VEL_FF_INITIAL_KS(deadband)}
+static const wheel_ff_config_t s_ff_cfg[WHEEL_COUNT] = {
+    VEL_FF_INITIAL(MOTOR_DEADBAND_FL), VEL_FF_INITIAL(MOTOR_DEADBAND_FR),
+    VEL_FF_INITIAL(MOTOR_DEADBAND_RL), VEL_FF_INITIAL(MOTOR_DEADBAND_RR)
+};
+
+#define VEL_FRICTION_BLEND_MMPS 60.0f /* 0..此轮速内以 smoothstep 平滑建立摩擦补偿 */
+#define VEL_STOP_ENTER_MMPS 15.0f
+#define VEL_STOP_EXIT_MMPS 30.0f
+#define VEL_STOP_SETTLE_S 0.10f
+static float s_stop_elapsed_s;
+static uint8_t s_stop_requested;
+static uint8_t s_stopped;
+#endif
+
 /** @brief 遥测用快照，不参与控制计算。 */
 static motor_cmd_t s_cmd_snapshot;
 motor_cmd_t g_motor_cmd;
@@ -175,6 +206,12 @@ void VelCtl_Init(void) {
     s_omega_prev = 0.0f;
     s_safe_latched = 1u;
 
+#if (MOTOR_TEST_MODE == 0)
+    s_stop_elapsed_s = 0.0f;
+    s_stop_requested = 0u;
+    s_stopped = 0u;
+#endif
+
     for (i = 0; i < (int)WHEEL_COUNT; i++) {
         s_cmd_snapshot.duty[i] = 0;
         s_cmd_snapshot.active[i] = 0u;
@@ -206,6 +243,11 @@ void VelCtl_SafeState(void) {
     s_vy_prev = 0.0f;
     s_omega_prev = 0.0f;
     s_safe_latched = 1u;
+#if (MOTOR_TEST_MODE == 0)
+    s_stop_elapsed_s = 0.0f;
+    s_stop_requested = 0u;
+    s_stopped = 0u;
+#endif
 }
 
 /*============================================================================*/
@@ -331,31 +373,66 @@ static void mecanum_inverse(float vx, float vy, float omega, float w[WHEEL_COUNT
         }
     }
 }
-// 如果满速转弯会导致v被砍，那么需要改进此部分代码，保证转弯时的直线速度
+/* 速度前馈 + 平滑摩擦前馈，方向取自目标轮速，不跟随反馈噪声翻转。
+ * x*x*(3-2*x) 在零点和混合区边界的斜率均为零，没有固定 PWM 跳变。
+ * 最终仍用原始 PWM 接口，避免与驱动层旧死区映射重复补偿。 */
+static float wheel_feedforward(WheelId_e id, float ref_mmps) {
+    const wheel_ff_config_t *cfg = &s_ff_cfg[id];
+    float speed = fabsf(ref_mmps);
+    float x = clampf(speed / VEL_FRICTION_BLEND_MMPS, 0.0f, 1.0f);
+    float blend = x * x * (3.0f - 2.0f * x);
+    float kv = (ref_mmps >= 0.0f) ? cfg->kv_positive : cfg->kv_negative;
+    float ks = (ref_mmps >= 0.0f) ? cfg->ks_positive : cfg->ks_negative;
+    float output = kv * speed + ks * blend;
+    return (ref_mmps >= 0.0f) ? output : -output;
+}
+
+/* 只在整车指令回中且斜坡目标全部到零后进入停车流程。
+ * 单轮目标为零的组合运动不触发。停车请求建立时清旧积分，减速期间
+ * 保留 P 制动但冻结积分；低速持续 100 ms 后归零输出。外力推动车辆
+ * 超过退出阈值时恢复速度环。这是零输出静止态，不是坡道位置保持。 */
+static uint8_t update_stop_state(const remote_in_t *cmd,
+                                 const float w[WHEEL_COUNT], float dt_s) {
+    uint8_t requested = (axis_normalized(cmd->lx) == 0.0f &&
+                         axis_normalized(cmd->ly) == 0.0f &&
+                         axis_normalized(cmd->rx) == 0.0f);
+    float peak_speed = 0.0f;
+    int i;
+    for (i = 0; i < (int)WHEEL_COUNT; i++) {
+        if (w[i] != 0.0f) requested = 0u;
+        float speed = fabsf(Encode_GetSpeedMmps(&s_enc[i]));
+        if (speed > peak_speed) peak_speed = speed;
+    }
+    if (requested == 0u) {
+        s_stop_requested = 0u;
+        s_stopped = 0u;
+        s_stop_elapsed_s = 0.0f;
+        return 0u;
+    }
+    if (s_stop_requested == 0u) {
+        for (i = 0; i < (int)WHEEL_COUNT; i++) PIDReset(&s_pid[i]);
+        s_stop_requested = 1u;
+    }
+    if (s_stopped != 0u && peak_speed > VEL_STOP_EXIT_MMPS) {
+        s_stopped = 0u;
+        s_stop_elapsed_s = 0.0f;
+    }
+    if (s_stopped == 0u) {
+        if (peak_speed <= VEL_STOP_ENTER_MMPS) {
+            s_stop_elapsed_s += dt_s;
+            if (s_stop_elapsed_s >= VEL_STOP_SETTLE_S) s_stopped = 1u;
+        } else {
+            s_stop_elapsed_s = 0.0f;
+        }
+    }
+    return s_stopped;
+}
+
 /**
-  * @brief 单轮速度环（结构完全对齐 D:\STM32\PID_Freertos）。
-  *
-  * 参考项目的速度环就是这么几步（motor.c:56-67）：
-  *
-  *     speed = PIDCalculate(&speed_pid, Encode_GetSpeedRpm(), speed, dt);
-  *     if (pwm > 0) { DIR 引脚置正 } else { DIR 引脚置反 }
-  *     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, fabsf(pwm));
-  *
-  * 没有前馈、没有死区补偿、没有低速冻结积分、没有输出滤波、没有任何限幅。
-  * 本函数与之等价，只是量纲从 RPM 换成 mm/s（1 RPM = 3.1416 mm/s），
-  * 并且一步到位把带符号占空比交给 motor_driver 去处理方向。
-  *
-  * ★ 这里刻意**不**加任何"保护层" ★
-  *   本工程在这条链上先后加过：定窗口测速、拒绝采样、变化率限幅、
-  *   速度物理上限 clamp、dt_s 守卫、DWT 自测时间——**每一样都制造了新的故障**
-  *   （最典型的是"拒绝采样"让 speed_mmps 永久为 0、电机狂转）。
-  *   完整记录见 user/control/encode.h 的文件头。
-  *   **闭环能正常工作的前提，就是把这条链保持得和参考项目一样短。**
-  *
-  * @param id       轮标识
-  * @param ref_mmps 目标轮速（mm/s，该轮前进为正）
-  * @param dt_s     采样周期（秒），与测速用的是同一个值
-  * @return 实际写入的带符号占空比
+  * @brief 单轮 PI + 速度前馈 + 平滑摩擦补偿。
+  * 前馈写入 PIDInstance，由控制器统一处理总输出限幅和抗积分饱和。
+  * 输出直接交给 Motor_SetRawDuty，不使用驱动层旧死区映射。
+  * 停车请求期间冻结积分；正常运动（含单轮零目标）继续闭环。
   */
 static int32_t wheel_loop_step(WheelId_e id, float ref_mmps, float dt_s) {
     float duty_frac;
@@ -391,13 +468,14 @@ static int32_t wheel_loop_step(WheelId_e id, float ref_mmps, float dt_s) {
     /* ★ 整个速度环★
      * 参数顺序是 (pid, measure, ref, dt_s) —— "实测值、目标值"的顺序，
          * 量纲：meas 与 ref 同为 mm/s，Kp/Ki 的单位是"占空比分数 / (mm/s)"。 */
+    s_pid[id].FeedForward = wheel_feedforward(id, ref_mmps);
+    if (s_stop_requested != 0u) PID_FreezeIntegral(&s_pid[id]);
     duty_frac = PIDCalculate(&s_pid[id], Encode_GetSpeedMmps(&s_enc[id]), ref_mmps, dt_s);
 
     duty_frac = clampf(duty_frac, -1.0f, 1.0f);
     duty_counts = (int32_t)(duty_frac * (float)MOTOR_PWM_FULL);
 
-    /* 直接写原始占空比，**绕过死区补偿**。
-     * 等基础闭环稳了、要消稳态误差时再加回来。 */
+    /* 前馈和摩擦补偿已计入 PID 总输出及抗饱和，不能再叠加旧死区映射。 */
     Motor_SetRawDuty(id, duty_counts);
 
     return duty_counts;
@@ -465,9 +543,11 @@ void VelCtl_Feed(const remote_in_t *cmd, float dt_s) {
         float vy;
         float omega;
         float w[WHEEL_COUNT];
+        uint8_t stopped;
 
         compute_body_cmd(cmd, dt_s, &vx, &vy, &omega);
         mecanum_inverse(vx, vy, omega, w);
+        stopped = update_stop_state(cmd, w, dt_s);
 
         for (i = 0; i < (int)WHEEL_COUNT; i++) {
             int32_t duty;
@@ -476,7 +556,14 @@ void VelCtl_Feed(const remote_in_t *cmd, float dt_s) {
              * 这里再保险一次，防止任何路径漏算导致超速。 */
             w[i] = clampf(w[i], -WHEEL_MAX_SPEED_MMPS, WHEEL_MAX_SPEED_MMPS);
 
-            duty = wheel_loop_step((WheelId_e)i, w[i], dt_s);
+            if (stopped != 0u) {
+                PIDReset(&s_pid[i]);
+                s_target_mmps[i] = w[i];
+                Motor_SetRawDuty((WheelId_e)i, 0);
+                duty = 0;
+            } else {
+                duty = wheel_loop_step((WheelId_e)i, w[i], dt_s);
+            }
             s_cmd_snapshot.duty[i] = (int16_t)clampi32(duty, -32768, 32767);
             s_cmd_snapshot.active[i] = (duty != 0) ? 1u : 0u;
         }
