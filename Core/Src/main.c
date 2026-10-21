@@ -112,6 +112,7 @@ int main(void)
   MX_TIM1_Init();
   MX_I2C1_Init();
   MX_IWDG_Init();
+  MX_TIM5_Init();
   /* USER CODE BEGIN 2 */
 
   /* 应用层初始化：建静态队列 + 建任务（全部 xTaskCreateStatic，不用 heap）。

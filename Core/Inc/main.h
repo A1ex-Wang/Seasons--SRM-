@@ -93,10 +93,10 @@ void Error_Handler(void);
 #define M2_ENC_B_GPIO_Port GPIOE
 #define ARMS5_PWM_Pin GPIO_PIN_15
 #define ARMS5_PWM_GPIO_Port GPIOB
-#define ARME_DIR2_Pin GPIO_PIN_8
-#define ARME_DIR2_GPIO_Port GPIOD
-#define ARME_DIR1_Pin GPIO_PIN_9
-#define ARME_DIR1_GPIO_Port GPIOD
+#define ARME_STEP_Pin GPIO_PIN_8
+#define ARME_STEP_GPIO_Port GPIOD
+#define ARME_DIR_Pin GPIO_PIN_9
+#define ARME_DIR_GPIO_Port GPIOD
 #define M3_DIR1_Pin GPIO_PIN_3
 #define M3_DIR1_GPIO_Port GPIOG
 #define M3_DIR2_Pin GPIO_PIN_4
