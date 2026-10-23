@@ -47,9 +47,10 @@ add_executable(${CMAKE_PROJECT_NAME}
         user/pose.h
         user/grab.c
         user/grab.h
+        user/stepper.c
+        user/stepper.h
         user/OLEDpower.c
         user/OLEDpower.h
-        user/strategy.c
         user/strategy.h
         user/telemetry.c
         user/telemetry.h
@@ -75,6 +76,8 @@ add_executable(${CMAKE_PROJECT_NAME}
         user/ssd1306/ssd1306_conf.h
         user/ssd1306/ssd1306_fonts.c
         user/ssd1306/ssd1306_fonts.h
+        Core/Src/MPU6050.c
+        Core/Inc/MPU6050.h
 )
 
 # Add STM32CubeMX generated sources

@@ -30,6 +30,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "app_types.h" /* App_Init() 与任务入口声明（user/app_types.h）*/
+#include "stepper.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -210,6 +211,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM6)
   {
     HAL_IncTick();
+  }
+  else if (htim->Instance == TIM5)
+  {
+    Stepper_TIM5_PeriodElapsed();
   }
   /* USER CODE BEGIN Callback 1 */
 

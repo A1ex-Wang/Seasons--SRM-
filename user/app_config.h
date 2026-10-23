@@ -42,6 +42,25 @@
 #define PRIO_REMOTE 26u     /* 蓝牙字节流解析、投队列 */
 #define PRIO_OLEDPOWER 20u  /* 最低：OLED 刷屏是"有就行"的功能，不能挡路 */
 
+/*============================================================================*/
+/* 2A. J1 步进旋转关节（A4988，GPIO STEP/DIR + TIM5 更新中断）                 */
+/*============================================================================*/
+
+/* 17HS4401：1.8°/步；A4988 初始使用 1/8 细分；同步带减速 1:5。 */
+#define STEPPER_MOTOR_STEPS_REV       200u
+#define STEPPER_MICROSTEP             8u
+#define STEPPER_GEAR_RATIO            5u
+#define STEPPER_MAX_POSITION_STEPS    (STEPPER_MOTOR_STEPS_REV * STEPPER_MICROSTEP * STEPPER_GEAR_RATIO)
+
+/* 输出轴初始目标速度：15 rpm = 2000 个电机 STEP 脉冲/秒。后续实测可调。 */
+#define STEPPER_TARGET_STEP_HZ        2000.0f
+#define STEPPER_MIN_STEP_HZ           300.0f
+#define STEPPER_ACCEL_STEP_HZ_S       2500.0f
+
+/* TIM5 预分频为 84-1，系统时钟配置下计数频率为 1 MHz。 */
+#define STEPPER_TIMER_TICK_HZ         1000000.0f
+#define STEPPER_DIR_POLARITY          (1) /* 改为 -1 可整体反向 */
+
 /* ★ 关于 PRIO_OLEDPOWER 必须最低（踩过的坑）★
  * OLED 任务里有两处会长时间占住 CPU，必须让它们随时能被底盘任务抢占：
  *   1) StartOLEDPower 启动时调用 ssd1306_Init()，内部是**阻塞式**

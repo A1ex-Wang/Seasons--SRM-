@@ -534,6 +534,14 @@ void VelCtl_Feed(const remote_in_t *cmd, float dt_s) {
     }
     s_safe_latched = 0u;
 
+    /* 挡位互锁：CONTROL 帧的 S1/S2 位于 remote_in_t.buttons 的 bit4/bit5。
+     * 两个开关都关闭才是底盘挡；机械臂粗调、精调以及无效组合都必须让
+     * 底盘立即停止，避免机械臂操作时同一组摇杆同时驱动车体。 */
+    if ((cmd->buttons & ((1UL << 4) | (1UL << 5))) != 0U) {
+        VelCtl_SafeState();
+        return;
+    }
+
 #if (MOTOR_TEST_MODE != 0)
     /* 标定模式：不走闭环、不走运动学。 */
     run_open_loop_test(cmd);

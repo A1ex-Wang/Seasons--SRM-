@@ -50,32 +50,27 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOE, M1_DIR2_Pin|M2_DIR1_Pin|M2_DIR2_Pin|M1_DIR1_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, ARME_STEP_Pin|ARME_DIR_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOE, M1_DIR2_Pin|M2_DIR1_Pin|M2_DIR2_Pin|ARME_DIR_Pin
+                          |ARME_STEP_Pin|M1_DIR1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOG, M3_DIR1_Pin|M3_DIR2_Pin|M4_DIR1_Pin|M4_DIR2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : M1_DIR2_Pin M2_DIR1_Pin M2_DIR2_Pin M1_DIR1_Pin */
+  /* Configure ordinary direction pins. */
   GPIO_InitStruct.Pin = M1_DIR2_Pin|M2_DIR1_Pin|M2_DIR2_Pin|M1_DIR1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : ARME_STEP_Pin ARME_DIR_Pin */
-  GPIO_InitStruct.Pin = ARME_STEP_Pin|ARME_DIR_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+  /* STEP/DIR are toggled by the TIM5 ISR; use the fastest GPIO slew rate. */
+  GPIO_InitStruct.Pin = ARME_DIR_Pin|ARME_STEP_Pin;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /*Configure GPIO pins : M3_DIR1_Pin M3_DIR2_Pin M4_DIR1_Pin M4_DIR2_Pin */
   GPIO_InitStruct.Pin = M3_DIR1_Pin|M3_DIR2_Pin|M4_DIR1_Pin|M4_DIR2_Pin;

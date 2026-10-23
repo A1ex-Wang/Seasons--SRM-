@@ -10,6 +10,7 @@
 #include "i2c.h"
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
+#include "grab.h"
 
 #define ADC_CH_COUNT 2u
 #define ADC_CH_CURRENT 0u
@@ -244,6 +245,15 @@ static void oled_number(uint8_t row, const char *label, float value, const char 
                    (long)(hundred % 100), unit);
     oled_line(row, text);
 }
+static const char *oled_mode_code(void) {
+    switch (Grab_GetMode()) {
+        case GRAB_MODE_COARSE: return "M:A";
+        case GRAB_MODE_FINE:   return "M:F";
+        case GRAB_MODE_SAFE:   return "M:S";
+        case GRAB_MODE_CHASSIS:
+        default:               return "M:C";
+    }
+}
 static void oled_render(void) {
     power_monitor_t data;
     char text[24];
@@ -251,18 +261,25 @@ static void oled_render(void) {
     ssd1306_Fill(Black);
     if (data.valid == 0u || (uint32_t)(HAL_GetTick() - data.stamp_ms) >= POWER_SAMPLE_STALE_MS) {
         oled_line(0u, "V:-- V"); oled_line(1u, "I:-- A");
-        oled_line(2u, "P:-- W"); oled_line(3u, "ADC ERROR");
+        oled_line(2u, "P:-- W");
+        (void)snprintf(text, sizeof(text), "ADC ERROR %s", oled_mode_code());
+        oled_line(3u, text);
     } else {
         oled_number(0u, "V:", data.battery_v, "V");
         oled_number(1u, "I:", data.current_a, "A");
         oled_number(2u, "P:", data.power_w, "W");
-        if (g_power_diag.zero_cal_state == ZERO_CAL_BUSY) oled_line(3u, "ZERO CAL...");
-        else if (data.low_voltage != 0u) oled_line(3u, "LOW BATTERY");
-        else if (data.soc_valid == 0u) oled_line(3u, "SOC:-- WAIT REST");
-        else {
-            (void)snprintf(text, sizeof(text), "SOC:%3u%%", (unsigned)data.ratio_pct);
-            oled_line(3u, text);
+        if (g_power_diag.zero_cal_state == ZERO_CAL_BUSY) {
+            (void)snprintf(text, sizeof(text), "ZERO CAL... %s", oled_mode_code());
+        } else if (data.low_voltage != 0u) {
+            (void)snprintf(text, sizeof(text), "LOW BATTERY %s", oled_mode_code());
+        } else if (data.soc_valid == 0u) {
+            (void)snprintf(text, sizeof(text), "SOC:-- WAIT %s", oled_mode_code());
         }
+        else {
+            (void)snprintf(text, sizeof(text), "SOC:%3u%% %s",
+                           (unsigned)data.ratio_pct, oled_mode_code());
+        }
+        oled_line(3u, text);
     }
     ssd1306_UpdateScreen();
 }

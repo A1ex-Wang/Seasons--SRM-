@@ -278,7 +278,11 @@ static void build_remote_in(remote_in_t *out) {
         out->ly = g_last_control.left_y;
         out->rx = g_last_control.right_x;
         out->ry = g_last_control.right_y;
-        out->buttons = (uint32_t)g_last_control.buttons;
+        /* CONTROL 的 buttons、S1..S6 和方向键统一压入 remote_in_t.buttons：
+         * bit0..3=A/B/X/Y，bit4..9=S1..S6，bit10..12=D-pad。 */
+        out->buttons = (uint32_t)g_last_control.buttons
+                     | ((uint32_t)g_last_control.switches << 4)
+                     | ((uint32_t)g_last_control.dpad << 10);
         out->lt = 0u;
         out->rt = 0u;
     }
