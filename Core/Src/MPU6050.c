@@ -7,6 +7,14 @@
 
 #include "MPU6050.h"
 
+MPU_RawData_t rawData;
+MPU_SensorData_t sensorData;
+MPU_GyroCal_t gyroCal;
+MPU_Attitude_t attitude;
+uint8_t _addr;
+float _dt, _tau;
+float aScaleFactor, gScaleFactor;
+
 /// @brief Set the IMU address, check for connection, reset IMU, and set full range scale.
 /// @param I2Cx Pointer to I2C structure config.
 /// @param addr Hex address based on AD0 pin - 0x68 low or 0x69 high.
@@ -22,11 +30,14 @@ uint8_t MPU_begin(I2C_HandleTypeDef *I2Cx, uint8_t addr, uint8_t aScale, uint8_t
     _dt = dt;
 
     // Initialize variables
-    uint8_t check;
+    uint8_t check = 0U;
     uint8_t select;
 
     // Confirm device
-    HAL_I2C_Mem_Read(I2Cx, _addr, WHO_AM_I, 1, &check, 1, I2C_TIMOUT_MS);
+    if (HAL_I2C_Mem_Read(I2Cx, _addr, WHO_AM_I, I2C_MEMADD_SIZE_8BIT,
+                         &check, 1U, I2C_TIMOUT_MS) != HAL_OK) {
+        return 0U;
+    }
 
     // TODO: If 9250 or 6050 fails could it trigger the opposite check???
     if ((check == WHO_AM_I_9250_ANS) || (check == WHO_AM_I_6050_ANS))
@@ -38,6 +49,14 @@ uint8_t MPU_begin(I2C_HandleTypeDef *I2Cx, uint8_t addr, uint8_t aScale, uint8_t
         // Set the full scale ranges
         MPU_writeAccFullScaleRange(I2Cx, aScale);
         MPU_writeGyroFullScaleRange(I2Cx, gScale);
+
+        /* Gyro internal sample rate 1 kHz, output rate 100 Hz, DLPF 42 Hz. */
+        select = 9U;
+        (void)HAL_I2C_Mem_Write(I2Cx, _addr, SMPLRT_DIV,
+                                I2C_MEMADD_SIZE_8BIT, &select, 1U, I2C_TIMOUT_MS);
+        select = 0x03U;
+        (void)HAL_I2C_Mem_Write(I2Cx, _addr, CONFIG,
+                                I2C_MEMADD_SIZE_8BIT, &select, 1U, I2C_TIMOUT_MS);
 
         return 1;
     }

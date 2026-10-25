@@ -19,6 +19,18 @@
 
 #include "app_types.h"
 
+typedef struct {
+    float omega_ref_rads;
+    float omega_measured_rads;
+    float error_rads;
+    float integral;
+    float correction_rads;
+    float omega_output_rads;
+    uint8_t active;
+} YawRateWatch_t;
+
+extern volatile YawRateWatch_t g_yaw_rate_watch;
+
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -22,8 +22,8 @@
 #define GRAB_AXIS_DOMINANT_GAP      20
 
 #define GRAB_COARSE_SPEED_DEG_S     30.0f
-#define GRAB_FINE_SPEED_DEG_S       10.0f
-#define GRAB_GRIPPER_SPEED_DEG_S     8.0f
+#define GRAB_FINE_SPEED_DEG_S       GRAB_COARSE_SPEED_DEG_S
+#define GRAB_GRIPPER_SPEED_DEG_S    GRAB_COARSE_SPEED_DEG_S
 
 /* 每个舵机独立方向宏：1 = 逻辑角度增加对应舵机电气角度增加，
  * -1 = 逻辑角度增加对应舵机电气角度减小。 */
@@ -50,7 +50,7 @@ static GrabServo_t s_servo[GRAB_SERVO_COUNT] = {
     /* J3：实物约 15 度限位，软件从 20 度开始 */
     {&htim11, TIM_CHANNEL_1,  20.0f, 175.0f,  90.0f, GRAB_COARSE_SPEED_DEG_S, GRAB_J3_DIR},
     /* J4：硬件装反，先按角度增加为上升 */
-    {&htim13, TIM_CHANNEL_1,   5.0f, 175.0f,  90.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J4_DIR},
+    {&htim13, TIM_CHANNEL_1,  65.0f, 175.0f,  90.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J4_DIR},
     /* J5：DIR=1 时角度增加为逆时针，逻辑正方向要求顺时针，因此取反 */
     {&htim14, TIM_CHANNEL_1,   5.0f, 175.0f,  20.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J5_DIR},
     /* J6：100 开、139 闭，软件再缩窄一点 */
@@ -60,6 +60,40 @@ static GrabServo_t s_servo[GRAB_SERVO_COUNT] = {
 static GrabMode_e s_mode = GRAB_MODE_CHASSIS;
 /* 左摇杆主导轴：-1=未锁定，0=LX，1=LY。 */
 static int8_t s_left_axis_lock = -1;
+
+static uint32_t grab_angle_to_pulse(const GrabServo_t *servo);
+
+/* Ozone 调试专用：直接 watch 这些变量，不需要调用带形参的函数。 */
+volatile float g_grab_j2_target_angle_deg;
+volatile float g_grab_j3_target_angle_deg;
+volatile float g_grab_j4_target_angle_deg;
+volatile float g_grab_j5_target_angle_deg;
+volatile float g_grab_j6_target_angle_deg;
+volatile GrabServoWatch_t g_grab_j2_watch;
+volatile GrabServoWatch_t g_grab_j3_watch;
+volatile GrabServoWatch_t g_grab_j4_watch;
+volatile GrabServoWatch_t g_grab_j5_watch;
+volatile GrabServoWatch_t g_grab_j6_watch;
+
+static void grab_publish_debug_targets(void)
+{
+    g_grab_j2_target_angle_deg = s_servo[GRAB_J2_BIG_ARM].target_angle;
+    g_grab_j3_target_angle_deg = s_servo[GRAB_J3_FOREARM].target_angle;
+    g_grab_j4_target_angle_deg = s_servo[GRAB_J4_PITCH].target_angle;
+    g_grab_j5_target_angle_deg = s_servo[GRAB_J5_ROTATE].target_angle;
+    g_grab_j6_target_angle_deg = s_servo[GRAB_J6_GRIPPER].target_angle;
+
+    g_grab_j2_watch.target_angle_deg = s_servo[GRAB_J2_BIG_ARM].target_angle;
+    g_grab_j2_watch.pulse_us = grab_angle_to_pulse(&s_servo[GRAB_J2_BIG_ARM]);
+    g_grab_j3_watch.target_angle_deg = s_servo[GRAB_J3_FOREARM].target_angle;
+    g_grab_j3_watch.pulse_us = grab_angle_to_pulse(&s_servo[GRAB_J3_FOREARM]);
+    g_grab_j4_watch.target_angle_deg = s_servo[GRAB_J4_PITCH].target_angle;
+    g_grab_j4_watch.pulse_us = grab_angle_to_pulse(&s_servo[GRAB_J4_PITCH]);
+    g_grab_j5_watch.target_angle_deg = s_servo[GRAB_J5_ROTATE].target_angle;
+    g_grab_j5_watch.pulse_us = grab_angle_to_pulse(&s_servo[GRAB_J5_ROTATE]);
+    g_grab_j6_watch.target_angle_deg = s_servo[GRAB_J6_GRIPPER].target_angle;
+    g_grab_j6_watch.pulse_us = grab_angle_to_pulse(&s_servo[GRAB_J6_GRIPPER]);
+}
 
 static float grab_clampf(float value, float low, float high)
 {
@@ -181,6 +215,7 @@ void Grab_Init(void)
     for (i = 0U; i < GRAB_SERVO_COUNT; ++i) {
         grab_write_servo(&s_servo[i]);
     }
+    grab_publish_debug_targets();
 }
 
 void Grab_Feed(const remote_in_t *cmd, float dt_s)
@@ -219,6 +254,8 @@ void Grab_Feed(const remote_in_t *cmd, float dt_s)
         /* 底盘挡和安全挡都必须停止 J1，避免切挡后沿用上一帧指令。 */
         Stepper_Feed(0, dt_s);
     }
+
+    grab_publish_debug_targets();
 }
 
 GrabMode_e Grab_GetMode(void)

@@ -28,6 +28,12 @@ typedef enum {
     GRAB_MODE_SAFE
 } GrabMode_e;
 
+/* Ozone 调试结构：只保存观测值，不参与控制计算。 */
+typedef struct {
+    float target_angle_deg;
+    uint32_t pulse_us;
+} GrabServoWatch_t;
+
 /* 初始化五路舵机 PWM，设置初始姿态。 */
 void Grab_Init(void);
 
@@ -39,6 +45,19 @@ float Grab_GetTargetAngle(GrabServoId_e id);
 
 /* CubeMX 已创建 GrabTask；此强定义覆盖 freertos.c 中的弱空壳。 */
 void StartGrabTask(void *argument);
+
+/* Ozone 调试变量：单位为逻辑角度，直接 watch 变量名即可。 */
+extern volatile float g_grab_j2_target_angle_deg;
+extern volatile float g_grab_j3_target_angle_deg;
+extern volatile float g_grab_j4_target_angle_deg;
+extern volatile float g_grab_j5_target_angle_deg;
+extern volatile float g_grab_j6_target_angle_deg;
+
+extern volatile GrabServoWatch_t g_grab_j2_watch;
+extern volatile GrabServoWatch_t g_grab_j3_watch;
+extern volatile GrabServoWatch_t g_grab_j4_watch;
+extern volatile GrabServoWatch_t g_grab_j5_watch;
+extern volatile GrabServoWatch_t g_grab_j6_watch;
 
 #ifdef __cplusplus
 }

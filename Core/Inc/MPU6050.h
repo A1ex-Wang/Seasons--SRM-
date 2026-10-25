@@ -11,7 +11,7 @@
 // Libs
 #include <stdint.h>
 #include <math.h>
-#include "I2C.h"
+#include "i2c.h"
 
 // Constants
 #define RAD2DEG 57.2957795131
@@ -24,9 +24,11 @@
 #define AD0_HIGH          0x69
 #define GYRO_CONFIG       0x1B
 #define ACCEL_CONFIG      0x1C
+#define CONFIG             0x1A
+#define SMPLRT_DIV         0x19
 #define PWR_MGMT_1        0x6B
 #define ACCEL_XOUT_H      0x3B
-#define I2C_TIMOUT_MS     1000
+#define I2C_TIMOUT_MS     10U
 
 // Full scale ranges
 enum gyroscopeFullScaleRange
@@ -46,30 +48,34 @@ enum accelerometerFullScaleRange
 };
 
 // Structures
-struct RawData
+typedef struct
 {
     int16_t ax, ay, az, gx, gy, gz;
-} rawData;
+} MPU_RawData_t;
 
-struct SensorData
+typedef struct
 {
     float ax, ay, az, gx, gy, gz;
-} sensorData;
+} MPU_SensorData_t;
 
-struct GyroCal
+typedef struct
 {
     float x, y, z;
-} gyroCal;
+} MPU_GyroCal_t;
 
-struct Attitude
+typedef struct
 {
     float r, p, y;
-} attitude;
+} MPU_Attitude_t;
 
 // Variables
-uint8_t _addr;
-float _dt, _tau;
-float aScaleFactor, gScaleFactor;
+extern MPU_RawData_t rawData;
+extern MPU_SensorData_t sensorData;
+extern MPU_GyroCal_t gyroCal;
+extern MPU_Attitude_t attitude;
+extern uint8_t _addr;
+extern float _dt, _tau;
+extern float aScaleFactor, gScaleFactor;
 
 // Functions
 uint8_t MPU_begin(I2C_HandleTypeDef *I2Cx, uint8_t addr, uint8_t aScale, uint8_t gScale, float tau, float dt);

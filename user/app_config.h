@@ -61,6 +61,15 @@
 #define STEPPER_TIMER_TICK_HZ         1000000.0f
 #define STEPPER_DIR_POLARITY          (1) /* 改为 -1 可整体反向 */
 
+/* MPU6050 角速度环：I2C1，Z 轴量程 ±500 °/s，100 Hz 读取。 */
+#define IMU_GYRO_Z_SIGN               (1) /* 安装方向反了就改为 -1 */
+#define IMU_GYRO_CAL_SAMPLES          200u
+#define IMU_GYRO_LPF_ALPHA            0.25f
+#define YAW_RATE_KP                   0.05f
+#define YAW_RATE_KI                   0.00f
+#define YAW_RATE_INTEGRAL_LIMIT       0.80f
+#define YAW_RATE_OUTPUT_LIMIT_RADS    2.0f
+
 /* ★ 关于 PRIO_OLEDPOWER 必须最低（踩过的坑）★
  * OLED 任务里有两处会长时间占住 CPU，必须让它们随时能被底盘任务抢占：
  *   1) StartOLEDPower 启动时调用 ssd1306_Init()，内部是**阻塞式**
@@ -367,9 +376,9 @@
  *   注意：这里说的"为正"是 relative 该轮的物理前进方向，不是车体前进方向 ——
  *   麦轮直行时左右两侧轮子的物理转向本来就相反，那是由运动学的目标值符号
  *   区分的（见 velocity_control.c 的 mecanum_inverse），与本组标定宏无关。 */
-#define MOTOR_SIGN_DIR_FL (-1)
+#define MOTOR_SIGN_DIR_FL (1)
 #define MOTOR_SIGN_PWM_FL (1)
-#define MOTOR_SIGN_ENC_FL (1)   /* 曾经是 -1，与 PWM_FL=+1 反号 → 正反馈震荡，已修正 */
+#define MOTOR_SIGN_ENC_FL (-1)   /* 曾经是 -1，与 PWM_FL=+1 反号 → 正反馈震荡，已修正 */
 #define MOTOR_DEADBAND_FL 1000u
 
 #define MOTOR_SIGN_DIR_FR (1)
@@ -382,9 +391,9 @@
 #define MOTOR_SIGN_ENC_RL (-1)
 #define MOTOR_DEADBAND_RL 1000u
 
-#define MOTOR_SIGN_DIR_RR (-1)
+#define MOTOR_SIGN_DIR_RR (1)
 #define MOTOR_SIGN_PWM_RR (1)
-#define MOTOR_SIGN_ENC_RR (-1)
+#define MOTOR_SIGN_ENC_RR (1)
 #define MOTOR_DEADBAND_RR 1000u
 
 /* 开环标定模式：置 1 后速度环停摆，四个轮子直接吃由摇杆调制的固定占空比，

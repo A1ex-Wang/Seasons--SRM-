@@ -47,6 +47,7 @@
 #include "control/controller.h"
 #include "control/encode.h"
 #include "motor_driver.h"
+#include "sensorimu.h"
 #include "stm32f4xx_hal_tim.h"
 
 /* CubeMX 在 Core/Src/tim.c 生成的编码器定时器句柄。 */
@@ -112,6 +113,8 @@ static float s_target_mmps[WHEEL_COUNT];
 static float s_vx_prev = 0.0f;
 static float s_vy_prev = 0.0f;
 static float s_omega_prev = 0.0f;
+static float s_yaw_rate_integral = 0.0f;
+volatile YawRateWatch_t g_yaw_rate_watch;
 
 /** @brief 链路无效时的安全态标志：1 = 已经处于全零输出，不必重复写 PWM。 */
 static uint8_t s_safe_latched = 1u;
@@ -204,6 +207,7 @@ void VelCtl_Init(void) {
     s_vx_prev = 0.0f;
     s_vy_prev = 0.0f;
     s_omega_prev = 0.0f;
+    s_yaw_rate_integral = 0.0f;
     s_safe_latched = 1u;
 
 #if (MOTOR_TEST_MODE == 0)
@@ -242,6 +246,7 @@ void VelCtl_SafeState(void) {
     s_vx_prev = 0.0f;
     s_vy_prev = 0.0f;
     s_omega_prev = 0.0f;
+    s_yaw_rate_integral = 0.0f;
     s_safe_latched = 1u;
 #if (MOTOR_TEST_MODE == 0)
     s_stop_elapsed_s = 0.0f;
@@ -345,6 +350,52 @@ static void compute_body_cmd(const remote_in_t *cmd, float dt_s,
     *vx = vx_t;
     *vy = vy_t;
     *omega = om_t;
+}
+
+/**
+  * @brief Z 轴角速度 PI 环。
+  *
+  * 现有四路轮速 PI 是最内层；这里根据 MPU6050 实测角速度修正车体
+  * 的 omega，再交给麦轮逆运动学。传感器未就绪时保持原来的开环 omega，
+  * 这样 MPU 未接好不会阻塞底盘调试。
+  */
+static float yaw_rate_loop(float omega_ref, float dt_s)
+{
+    float measured;
+    float error;
+    float correction;
+    float omega_cmd;
+
+    if (SensorImu_IsReady() == 0U) {
+        s_yaw_rate_integral = 0.0f;
+        g_yaw_rate_watch.omega_ref_rads = omega_ref;
+        g_yaw_rate_watch.omega_measured_rads = 0.0f;
+        g_yaw_rate_watch.error_rads = 0.0f;
+        g_yaw_rate_watch.integral = 0.0f;
+        g_yaw_rate_watch.correction_rads = 0.0f;
+        g_yaw_rate_watch.omega_output_rads = omega_ref;
+        g_yaw_rate_watch.active = 0U;
+        return omega_ref;
+    }
+
+    measured = SensorImu_GetYawRateRads();
+    error = omega_ref - measured;
+    s_yaw_rate_integral += error * dt_s;
+    s_yaw_rate_integral = clampf(s_yaw_rate_integral,
+                                  -YAW_RATE_INTEGRAL_LIMIT,
+                                  YAW_RATE_INTEGRAL_LIMIT);
+    correction = YAW_RATE_KP * error + YAW_RATE_KI * s_yaw_rate_integral;
+    omega_cmd = clampf(omega_ref + correction,
+                       -YAW_RATE_OUTPUT_LIMIT_RADS,
+                       YAW_RATE_OUTPUT_LIMIT_RADS);
+    g_yaw_rate_watch.omega_ref_rads = omega_ref;
+    g_yaw_rate_watch.omega_measured_rads = measured;
+    g_yaw_rate_watch.error_rads = error;
+    g_yaw_rate_watch.integral = s_yaw_rate_integral;
+    g_yaw_rate_watch.correction_rads = correction;
+    g_yaw_rate_watch.omega_output_rads = omega_cmd;
+    g_yaw_rate_watch.active = 1U;
+    return omega_cmd;
 }
 
 /**
@@ -554,6 +605,7 @@ void VelCtl_Feed(const remote_in_t *cmd, float dt_s) {
         uint8_t stopped;
 
         compute_body_cmd(cmd, dt_s, &vx, &vy, &omega);
+        omega = yaw_rate_loop(omega, dt_s);
         mecanum_inverse(vx, vy, omega, w);
         stopped = update_stop_state(cmd, w, dt_s);
 
