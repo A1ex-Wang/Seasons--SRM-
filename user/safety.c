@@ -4,7 +4,7 @@
   * @brief   安全任务（Safety）。
   *
   * 任务职责：以 10 ms 周期喂独立看门狗（IWDG）。若调度器停摆、任务被无限阻塞
-  *           或发生非法死循环，IWDG 会在约 4 s 后复位 MCU —— 这是遥控机器人
+  *           或发生非法死循环，IWDG 会在约 0.5 s 后复位 MCU —— 这是遥控机器人
   *           最基本的一道保命措施（本阶段虽然不驱动电机，但链路必须从第一天
   *           就带着看门狗跑，避免后期把“忘了喂狗”当成业务 bug 排查）。
   *
@@ -32,9 +32,7 @@ void Safety_WatchdogStart(void) {
      *    即 8 ms 一个计数。 */
     IWDG->PR = APP_IWDG_PRESCALER;
 
-    /* ③ 重装值：499 → 499 × 8 ms ≈ 4.0 s。
-     *    取值偏长的理由：调试器（Ozone）下断点/单步会停住 CPU，喂狗任务同样
-     *    停住；超时太短会在单步调试时被反复复位。4 s 仍能兜住真正的死锁。 */
+    /* ③ 重装值：62 → 62 × 8 ms ≈ 0.5 s（LSI 频率存在误差）。 */
     IWDG->RLR = APP_IWDG_RELOAD;
 
     /* ④ 等待 SR 里的 PVU/RVU 清零，确认 PR/RLR 已生效（LSI 由硬件自动开启）。 */
@@ -57,14 +55,14 @@ void StartSafetyTask(void *argument) {
      *
      * ⚠ DEBUG_NO_WATCHDOG = 1 时跳过启动，供**调试期**使用：
      *   IWDG 一旦启动就无法关闭，而调试器（Ozone）下断点/单步会停住 CPU，
-     *   喂狗任务同样停住 → 约 4 秒后芯片被复位，变量全丢、断点全失效。
+     *   喂狗任务同样停住 → 约 0.5 秒后芯片被复位，变量全丢、断点全失效。
      *   这个开关只影响"是否启动看门狗"，不影响任务本身的周期与喂狗动作
      *   （下面的 for 循环照常执行，只是没有开启的 IWDG 会忽略 KR 写入）。
      *
      *   正常固件（尤其是带电机的实跑）必须保持 0：
      *   看门狗是"程序跑飞时自动停机"的最后一道保护。 */
 #ifndef DEBUG_NO_WATCHDOG
-#define DEBUG_NO_WATCHDOG 1
+#define DEBUG_NO_WATCHDOG 0
 #endif
 
 #if (DEBUG_NO_WATCHDOG == 0)

@@ -16,10 +16,10 @@ extern "C" {
 #endif
 
 /**
-  * @brief 启动独立看门狗 IWDG（约 4 s 超时）。
+  * @brief 启动独立看门狗 IWDG（标称约 0.5 s 超时）。
   *
   * 必须在调度器起来之后、且即将进入喂狗循环之前调用一次，
-  * 否则“启动完就没人喂”会在 4 s 后被复位。
+  * 否则“启动完就没人喂”会在约 0.5 s 后被复位。
   * 直接操作寄存器，不依赖 HAL IWDG 模块（见 app_config.h 的说明）。
   */
 void Safety_WatchdogStart(void);

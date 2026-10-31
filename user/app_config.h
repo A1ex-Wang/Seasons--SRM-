@@ -472,11 +472,9 @@
  *
  * 超时时间 = (4 * 2^PR) * RLR / f_LSI，f_LSI 典型值 32 kHz。
  * PR = 6 → 分频 4 * 2^6 = 256 → 计数器时钟 = 32 kHz / 256 = 125 Hz → 8 ms/计数。
- * RLR = 499 → 499 * 8 ms ≈ 4.0 s。
- * 取 4 s 而不是更短：Ozone 单步/断点会长时间停住 CPU，喂狗任务同样停住，
- * 超时太短会在调试时被反复复位。4 s 依然能兜住真正的死锁。 */
+ * RLR = 62 → 62 * 8 ms ≈ 0.50 s（LSI 频率存在误差）。 */
 #define APP_IWDG_PRESCALER 6u /* PR[2:0]：6 → 分频 4 * 2^6 = 256 */
-#define APP_IWDG_RELOAD 499u  /* RLR：约 4.0 s @ 32 kHz LSI */
+#define APP_IWDG_RELOAD 62u   /* RLR：约 0.50 s @ 32 kHz LSI */
 
 /* IWDG 键寄存器（IWDG_KR）的魔术值。STM32 的设备头文件只定义了 IWDG_KR_KEY
  * 位域，没有给这几个键值起名字，所以在这里集中定义，避免 .c 里出现裸数字。

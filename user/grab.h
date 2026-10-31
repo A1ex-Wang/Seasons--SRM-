@@ -34,6 +34,17 @@ typedef struct {
     uint32_t pulse_us;
 } GrabServoWatch_t;
 
+/* Ozone 调试：记录机械臂输入与左摇杆最终选轴结果。 */
+typedef struct {
+    int16_t lx;
+    int16_t ly;
+    int8_t selected_lx;
+    int8_t selected_ly;
+    int8_t axis_lock;
+    uint8_t online;
+    uint8_t mode;
+} GrabInputWatch_t;
+
 /* 初始化五路舵机 PWM，设置初始姿态。 */
 void Grab_Init(void);
 
@@ -58,6 +69,7 @@ extern volatile GrabServoWatch_t g_grab_j3_watch;
 extern volatile GrabServoWatch_t g_grab_j4_watch;
 extern volatile GrabServoWatch_t g_grab_j5_watch;
 extern volatile GrabServoWatch_t g_grab_j6_watch;
+extern volatile GrabInputWatch_t g_grab_input_watch;
 
 #ifdef __cplusplus
 }

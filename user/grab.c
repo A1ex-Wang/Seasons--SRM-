@@ -52,7 +52,7 @@ static GrabServo_t s_servo[GRAB_SERVO_COUNT] = {
     /* J4：硬件装反，先按角度增加为上升 */
     {&htim13, TIM_CHANNEL_1,  65.0f, 175.0f,  90.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J4_DIR},
     /* J5：DIR=1 时角度增加为逆时针，逻辑正方向要求顺时针，因此取反 */
-    {&htim14, TIM_CHANNEL_1,   5.0f, 175.0f,  20.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J5_DIR},
+    {&htim14, TIM_CHANNEL_1,   0.0f, 180.0f,  20.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J5_DIR},
     /* J6：100 开、139 闭，软件再缩窄一点 */
     {&htim12, TIM_CHANNEL_2, 102.0f, 137.0f, 120.0f, GRAB_GRIPPER_SPEED_DEG_S, GRAB_J6_DIR}
 };
@@ -74,6 +74,7 @@ volatile GrabServoWatch_t g_grab_j3_watch;
 volatile GrabServoWatch_t g_grab_j4_watch;
 volatile GrabServoWatch_t g_grab_j5_watch;
 volatile GrabServoWatch_t g_grab_j6_watch;
+volatile GrabInputWatch_t g_grab_input_watch;
 
 static void grab_publish_debug_targets(void)
 {
@@ -93,6 +94,31 @@ static void grab_publish_debug_targets(void)
     g_grab_j5_watch.pulse_us = grab_angle_to_pulse(&s_servo[GRAB_J5_ROTATE]);
     g_grab_j6_watch.target_angle_deg = s_servo[GRAB_J6_GRIPPER].target_angle;
     g_grab_j6_watch.pulse_us = grab_angle_to_pulse(&s_servo[GRAB_J6_GRIPPER]);
+}
+
+static void grab_publish_stepper_input(const remote_in_t *cmd,
+                                       int8_t selected_lx,
+                                       int8_t selected_ly)
+{
+    if (cmd == NULL) {
+        g_stepper_debug_watch.lx = 0;
+        g_stepper_debug_watch.ly = 0;
+        g_stepper_debug_watch.rx = 0;
+        g_stepper_debug_watch.ry = 0;
+        g_stepper_debug_watch.buttons = 0U;
+        g_stepper_debug_watch.online = 0U;
+    } else {
+        g_stepper_debug_watch.lx = cmd->lx;
+        g_stepper_debug_watch.ly = cmd->ly;
+        g_stepper_debug_watch.rx = cmd->rx;
+        g_stepper_debug_watch.ry = cmd->ry;
+        g_stepper_debug_watch.buttons = cmd->buttons;
+        g_stepper_debug_watch.online = cmd->online;
+    }
+    g_stepper_debug_watch.grab_mode = (uint8_t)s_mode;
+    g_stepper_debug_watch.axis_lock = s_left_axis_lock;
+    g_stepper_debug_watch.selected_lx = selected_lx;
+    g_stepper_debug_watch.selected_ly = selected_ly;
 }
 
 static float grab_clampf(float value, float low, float high)
@@ -224,19 +250,41 @@ void Grab_Feed(const remote_in_t *cmd, float dt_s)
     int8_t left_y_sign;
 
     if (cmd == NULL || dt_s <= 0.0f) {
+        g_grab_input_watch.online = 0U;
+        g_grab_input_watch.mode = (uint8_t)GRAB_MODE_SAFE;
+        g_grab_input_watch.lx = 0;
+        g_grab_input_watch.ly = 0;
+        g_grab_input_watch.selected_lx = 0;
+        g_grab_input_watch.selected_ly = 0;
+        g_grab_input_watch.axis_lock = -1;
+        grab_publish_stepper_input(NULL, 0, 0);
         Stepper_Feed(0, dt_s);
         return;
     }
+
+    g_grab_input_watch.online = cmd->online;
+    g_grab_input_watch.lx = cmd->lx;
+    g_grab_input_watch.ly = cmd->ly;
 
     if (cmd->online == 0U) {
         s_mode = GRAB_MODE_SAFE;
         s_left_axis_lock = -1;
         Stepper_Feed(0, dt_s);
+        g_grab_input_watch.mode = (uint8_t)s_mode;
+        g_grab_input_watch.selected_lx = 0;
+        g_grab_input_watch.selected_ly = 0;
+        g_grab_input_watch.axis_lock = s_left_axis_lock;
+        grab_publish_stepper_input(cmd, 0, 0);
         return;
     }
 
     grab_update_mode(cmd->buttons);
     grab_select_left_axis(cmd->lx, cmd->ly, &left_x_sign, &left_y_sign);
+    g_grab_input_watch.mode = (uint8_t)s_mode;
+    g_grab_input_watch.selected_lx = left_x_sign;
+    g_grab_input_watch.selected_ly = left_y_sign;
+    g_grab_input_watch.axis_lock = s_left_axis_lock;
+    grab_publish_stepper_input(cmd, left_x_sign, left_y_sign);
 
     if (s_mode == GRAB_MODE_COARSE) {
         /* LY 正值：大臂目标角增加；RY 正值：小臂目标角增加。 */

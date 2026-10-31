@@ -9,6 +9,33 @@ static volatile int8_t s_requested_dir;
 static volatile int8_t s_active_dir;
 static volatile float s_step_hz;
 static volatile uint8_t s_timer_running;
+volatile StepperWatch_t g_stepper_watch;
+volatile StepperDebugWatch_t g_stepper_debug_watch;
+
+static void stepper_publish_watch(int8_t command_sign)
+{
+    g_stepper_watch.command_sign = command_sign;
+    g_stepper_watch.requested_dir = s_requested_dir;
+    g_stepper_watch.active_dir = s_active_dir;
+    g_stepper_watch.position_steps = s_position_steps;
+    g_stepper_watch.step_hz = s_step_hz;
+    g_stepper_watch.timer_running = s_timer_running;
+    g_stepper_watch.tim5_cr1 = TIM5->CR1;
+    g_stepper_watch.tim5_dier = TIM5->DIER;
+    g_stepper_watch.step_pin_level = (uint8_t)HAL_GPIO_ReadPin(ARME_STEP_GPIO_Port, ARME_STEP_Pin);
+    g_stepper_watch.dir_pin_level = (uint8_t)HAL_GPIO_ReadPin(ARME_DIR_GPIO_Port, ARME_DIR_Pin);
+
+    g_stepper_debug_watch.command_sign = command_sign;
+    g_stepper_debug_watch.requested_dir = s_requested_dir;
+    g_stepper_debug_watch.active_dir = s_active_dir;
+    g_stepper_debug_watch.position_steps = s_position_steps;
+    g_stepper_debug_watch.step_hz = s_step_hz;
+    g_stepper_debug_watch.timer_running = s_timer_running;
+    g_stepper_debug_watch.tim5_cr1 = TIM5->CR1;
+    g_stepper_debug_watch.tim5_dier = TIM5->DIER;
+    g_stepper_debug_watch.step_pin_level = g_stepper_watch.step_pin_level;
+    g_stepper_debug_watch.dir_pin_level = g_stepper_watch.dir_pin_level;
+}
 
 static void stepper_stop_timer(void)
 {
@@ -56,6 +83,7 @@ void Stepper_Init(void)
     s_timer_running = 0U;
     stepper_stop_timer();
     stepper_set_dir(1);
+    stepper_publish_watch(0);
 }
 
 void Stepper_Feed(int8_t command_sign, float dt_s)
@@ -90,12 +118,14 @@ void Stepper_Feed(int8_t command_sign, float dt_s)
             s_active_dir = s_requested_dir;
             stepper_set_dir(s_active_dir);
         }
+        stepper_publish_watch(command_sign);
         return;
     }
 
     stepper_set_frequency(s_step_hz);
     stepper_set_dir(s_active_dir);
     stepper_start_timer();
+    stepper_publish_watch(command_sign);
 }
 
 void Stepper_TIM5_PeriodElapsed(void)
@@ -109,6 +139,7 @@ void Stepper_TIM5_PeriodElapsed(void)
         if ((s_active_dir > 0 && s_position_steps >= (int32_t)STEPPER_MAX_POSITION_STEPS) ||
             (s_active_dir < 0 && s_position_steps <= 0)) {
             stepper_stop_timer();
+            stepper_publish_watch(s_active_dir);
             return;
         }
         s_position_steps += (s_active_dir > 0) ? 1 : -1;
