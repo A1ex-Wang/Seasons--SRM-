@@ -23,6 +23,7 @@
 
 #define GRAB_COARSE_SPEED_DEG_S     30.0f
 #define GRAB_FINE_SPEED_DEG_S       GRAB_COARSE_SPEED_DEG_S
+#define GRAB_ROTATE_SPEED_DEG_S     65.0f
 #define GRAB_GRIPPER_SPEED_DEG_S    GRAB_COARSE_SPEED_DEG_S
 
 /* 每个舵机独立方向宏：1 = 逻辑角度增加对应舵机电气角度增加，
@@ -46,13 +47,13 @@ typedef struct {
 
 static GrabServo_t s_servo[GRAB_SERVO_COUNT] = {
     /* J2：0 水平，90 竖直；超过 90 后继续下降 */
-    {&htim10, TIM_CHANNEL_1,   5.0f, 175.0f,  90.0f, GRAB_COARSE_SPEED_DEG_S, GRAB_J2_DIR},
+    {&htim10, TIM_CHANNEL_1,   8.0f, 175.0f,  90.0f, GRAB_COARSE_SPEED_DEG_S, GRAB_J2_DIR},
     /* J3：实物约 15 度限位，软件从 20 度开始 */
     {&htim11, TIM_CHANNEL_1,  20.0f, 175.0f,  90.0f, GRAB_COARSE_SPEED_DEG_S, GRAB_J3_DIR},
     /* J4：硬件装反，先按角度增加为上升 */
-    {&htim13, TIM_CHANNEL_1,  65.0f, 175.0f,  90.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J4_DIR},
+    {&htim13, TIM_CHANNEL_1,  0.0f, 175.0f,  90.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J4_DIR},
     /* J5：DIR=1 时角度增加为逆时针，逻辑正方向要求顺时针，因此取反 */
-    {&htim14, TIM_CHANNEL_1,   0.0f, 180.0f,  20.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J5_DIR},
+    {&htim14, TIM_CHANNEL_1,   0.0f, 180.0f,  20.0f, GRAB_ROTATE_SPEED_DEG_S, GRAB_J5_DIR},
     /* J6：100 开、139 闭，软件再缩窄一点 */
     {&htim12, TIM_CHANNEL_2, 102.0f, 137.0f, 120.0f, GRAB_GRIPPER_SPEED_DEG_S, GRAB_J6_DIR}
 };
