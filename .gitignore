@@ -2,7 +2,6 @@
 .idea/
 cmake-build-*/
 build/
-cmake/
 
 # CubeMX
 .mxproject
@@ -14,3 +13,6 @@ cmake/
 *.bin
 *.map
 *.list
+
+# 本地模型与场地资料
+/sw/
