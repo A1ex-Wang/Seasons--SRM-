@@ -1,4 +1,4 @@
-/** 电源测量与 OLED 显示。CubeMX 创建测量入口，入口再创建独立静态显示任务。 */
+/* 电源测量与 OLED 显示。CubeMX 创建测量入口，入口再创建独立静态显示任务。 */
 #ifndef ROBO_OLEDPOWER_H
 #define ROBO_OLEDPOWER_H
 #include <stdint.h>

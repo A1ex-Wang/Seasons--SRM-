@@ -20,7 +20,7 @@ typedef struct {
     uint8_t dir_pin_level;
 } StepperWatch_t;
 
-/* Ozone 统一调试出口：输入、机械臂挡位、轴选择和步进执行状态。 */
+/* 步进控制状态快照：遥控输入、模式、选轴和脉冲输出。 */
 typedef struct {
     int16_t lx;
     int16_t ly;

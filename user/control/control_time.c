@@ -1,6 +1,4 @@
-//
-// Created by 18045 on 2026/9/2.
-//
+
 
 #include "control_time.h"
 #include "main.h"

@@ -43,17 +43,12 @@ add_executable(${CMAKE_PROJECT_NAME}
         user/remote.h
         user/sensorimu.c
         user/sensorimu.h
-        user/pose.c
-        user/pose.h
         user/grab.c
         user/grab.h
         user/stepper.c
         user/stepper.h
         user/OLEDpower.c
         user/OLEDpower.h
-        user/strategy.h
-        user/telemetry.c
-        user/telemetry.h
         user/app_config.h
         user/app_types.h
         user/debug_uart.c

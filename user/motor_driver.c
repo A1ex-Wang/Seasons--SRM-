@@ -1,24 +1,6 @@
-/**
-  ******************************************************************************
-  * @file    motor_driver.c
-  * @brief   底盘四路 TB6612FNG 通道的底层驱动实现。
-  *
-  * 硬件映射（与 app_types.h 的 WheelId_e 注释一致）：
-  *   FL: PWM = TIM9_CH1 (PE5)   DIR = PE1 / PE2
-  *   FR: PWM = TIM9_CH2 (PE6)   DIR = PE3 / PE4
-  *   RL: PWM = TIM8_CH3 (PC8)   DIR = PG3 / PG4
-  *   RR: PWM = TIM8_CH4 (PC9)   DIR = PG5 / PG6
-  *
-  * TB6612 真值表（每通道 AIN1 / AIN2 / PWMA）：
-  *   AIN1=0, AIN2=1 → 正转（PWM 有效）
-  *   AIN1=1, AIN2=0 → 反转（PWM 有效）
-  *   AIN1=AIN2      → 刹车（同为 1）或滑行（同为 0），此时 PWM 无效
-  * 本模块把“正转”定义为该轮物理前进方向，具体哪个脚为高由 app_config.h 的
-  * MOTOR_SIGN_DIR_* 标定（+1 → 前进时 AIN1 低 / AIN2 高）。
-  *
-  * STBY 由硬件外接 3V3 常高，无需软件干预。
-  ******************************************************************************
-  */
+/** @file motor_driver.c
+ * @brief 底盘四路 TB6612FNG 通道的底层驱动实现。
+ */
 
 #include "motor_driver.h"
 
@@ -33,9 +15,7 @@
 extern TIM_HandleTypeDef htim8;
 extern TIM_HandleTypeDef htim9;
 
-/*============================================================================*/
-/* 每轮硬件绑定表                                                              */
-/*============================================================================*/
+/* 每轮硬件绑定表 */
 
 typedef struct {
     TIM_HandleTypeDef *htim;  /**< PWM 定时器 */
@@ -49,7 +29,9 @@ typedef struct {
     uint32_t deadband; /**< 启动死区（PWM 计数） */
 } motor_hw_t;
 
-/* 顺序必须与 WheelId_e 一致：FL, FR, RL, RR。 */
+/* FL: TIM9_CH1 / PE1、PE2；FR: TIM9_CH2 / PE3、PE4。
+ * RL: TIM8_CH3 / PG3、PG4；RR: TIM8_CH4 / PG5、PG6。
+ * 数组顺序：左前、右前、左后、右后。 */
 static const motor_hw_t s_motor_hw[WHEEL_COUNT] = {
     /* WHEEL_FL —— M1：TIM9_CH1(PE5)，DIR = PE1/PE2 */
     {&htim9, TIM_CHANNEL_1, GPIOE, M1_DIR1_Pin, GPIOE, M1_DIR2_Pin,
@@ -68,18 +50,16 @@ static const motor_hw_t s_motor_hw[WHEEL_COUNT] = {
 /** @brief 当前实际写到 PWM 比较寄存器的值（带符号），供遥测观察。 */
 static int32_t s_applied_duty[WHEEL_COUNT];
 
-/*============================================================================*/
-/* 内部工具                                                                    */
-/*============================================================================*/
+/* 内部工具 */
 
-/**
+/*
   * @brief 按带符号占空比设置 TB6612 的方向脚。
   *
   * forward > 0 表示该轮物理前进。AIN1/AIN2 的具体电平由 sign_dir 决定：
   *   sign_dir = +1 → 前进时 AIN1=0, AIN2=1
   *   sign_dir = -1 → 前进时 AIN1=1, AIN2=0
   * 占空比为 0 时两脚都置 0（滑行），避免零占空比下堵转发热。
-  */
+ */
 static void set_direction(const motor_hw_t *hw, int forward) {
     int a;
     int b;
@@ -111,20 +91,11 @@ static void write_pwm(const motor_hw_t *hw, int32_t duty) {
     __HAL_TIM_SET_COMPARE(hw->htim, hw->channel, (uint32_t)magnitude);
 }
 
-/*============================================================================*/
-/* 对外接口                                                                    */
-/*============================================================================*/
+/* 对外接口 */
 
 /**
-  * @brief 死区补偿的“直通带”阈值（占空比计数）。
-  *
-  * 期望占空比小于它时不做死区抬升，直接原样输出。原因：
-  *   如果对所有非零指令都做 “+DEADBAND” 抬升，那么速度环输出 10 个计数也会
-  *   变成 1010——低级指令被放大 100 倍，闭环在小信号区完全失去线性度，
-  *   Kp 也就没法整定了（表现为“轻轻一动就猛冲”）。
-  * 超过这个阈值后，抬升量相对于指令本身已经不显著，可以安全地做压死区映射。
-  * 闭环里真正的“起步难”由 I 项自动补偿，这个函数只是帮它省点时间。
-  */
+ * @brief 死区补偿的“直通带”阈值（占空比计数）。
+ */
 #define MOTOR_COMP_LINEAR_BAND 200
 
 int32_t Motor_ApplyDeadbandComp(int32_t desired, uint32_t deadband) {
@@ -147,16 +118,7 @@ int32_t Motor_ApplyDeadbandComp(int32_t desired, uint32_t deadband) {
         magnitude = (int32_t)MOTOR_PWM_FULL; /* 先钳位，避免乘法溢出 */
     }
 
-    /* ── 分段映射 ──────────────────────────────────────────────────────────
-     * ① 小指令区（0 < x ≤ LINEAR_BAND）：直通，y = x。
-     *    保证闭环在小信号区是线性的，Kp 的物理意义明确。
-     * ② 大指令区（x > LINEAR_BAND）：把期望占空比当作“电机需要的有效电压”，
-     *    再加上被死区吃掉的那一段，形成压死区映射：
-     *      y = DEADBAND + x × (FULL − DEADBAND) / FULL
-     *    x = FULL → y = FULL（不越界）。
-     *
-     * ⚠ 反例（我第一版写错过，务必别改回去）：y = DEADBAND + x × span / span
-     *   是恒等映射，死区完全没被补偿，等于这段代码白写。 */
+    /* 分段映射 */
     if (magnitude <= (int32_t)MOTOR_COMP_LINEAR_BAND) {
         return sign * magnitude;
     }

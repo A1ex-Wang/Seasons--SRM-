@@ -1,16 +1,6 @@
-/**
-  ******************************************************************************
-  * @file    safety.c
-  * @brief   安全任务（Safety）。
-  *
-  * 任务职责：以 10 ms 周期喂独立看门狗（IWDG）。若调度器停摆、任务被无限阻塞
-  *           或发生非法死循环，IWDG 会在约 0.5 s 后复位 MCU —— 这是遥控机器人
-  *           最基本的一道保命措施（本阶段虽然不驱动电机，但链路必须从第一天
-  *           就带着看门狗跑，避免后期把“忘了喂狗”当成业务 bug 排查）。
-  *
-  * 周期：10 ms。优先级：34（全工程最高）。
-  ******************************************************************************
-  */
+/** @file safety.c
+ * @brief 安全任务（Safety）。
+ */
 
 #include "safety.h"
 
@@ -50,17 +40,7 @@ void StartSafetyTask(void *argument) {
 
     (void)argument;
 
-    /* 必须在开始循环前启动 IWDG：一旦启动就无法关闭，因此要保证启动之后
-     * 立刻就有喂狗动作跟着，中间不能出现长耗时操作。
-     *
-     * ⚠ DEBUG_NO_WATCHDOG = 1 时跳过启动，供**调试期**使用：
-     *   IWDG 一旦启动就无法关闭，而调试器（Ozone）下断点/单步会停住 CPU，
-     *   喂狗任务同样停住 → 约 0.5 秒后芯片被复位，变量全丢、断点全失效。
-     *   这个开关只影响"是否启动看门狗"，不影响任务本身的周期与喂狗动作
-     *   （下面的 for 循环照常执行，只是没有开启的 IWDG 会忽略 KR 写入）。
-     *
-     *   正常固件（尤其是带电机的实跑）必须保持 0：
-     *   看门狗是"程序跑飞时自动停机"的最后一道保护。 */
+    /* 必须在开始循环前启动 IWDG：一旦启动就无法关闭，因此要保证启动之后 */
 #ifndef DEBUG_NO_WATCHDOG
 #define DEBUG_NO_WATCHDOG 0
 #endif
@@ -69,15 +49,7 @@ void StartSafetyTask(void *argument) {
     Safety_WatchdogStart();
 #endif
 
-    /* ── ★把优先级强制成 app_config.h 的约定值★ ──────────────────────────
-     * 本任务由 CubeMX（Core/Src/freertos.c 的 osThreadNew）创建，优先级取自
-     * Robo.ioc 的 FREERTOS.Tasks01（那里是 41），而本工程的约定值在
-     * app_config.h 的 PRIO_SAFETY（34）。
-     *
-     * 为什么必须让约定值生效：喂狗任务必须**高于速度环**，否则速度环
-     * （或任何在它之上的阻塞任务）卡住时，喂狗会被饿死 → 看门狗复位 →
-     * 表现为"莫名重启"，而真正的原因（谁把 CPU 占住了）反而看不到。
-     * 让 app_config.h 成为唯一真相来源，CubeMX 里怎么填都不影响实际次序。 */
+    /* 使用 app_config.h 中的任务优先级。 */
     (void)vTaskPrioritySet(NULL, (UBaseType_t)PRIO_SAFETY);
 
     last_wake = xTaskGetTickCount();

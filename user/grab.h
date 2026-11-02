@@ -1,6 +1,4 @@
-//
-// Created by 18045 on 2026/9/28.
-//
+
 
 #ifndef ROBO_GRAB_H
 #define ROBO_GRAB_H
@@ -28,13 +26,13 @@ typedef enum {
     GRAB_MODE_SAFE
 } GrabMode_e;
 
-/* Ozone 调试结构：只保存观测值，不参与控制计算。 */
+/* 舵机状态快照，不参与控制计算。 */
 typedef struct {
     float target_angle_deg;
     uint32_t pulse_us;
 } GrabServoWatch_t;
 
-/* Ozone 调试：记录机械臂输入与左摇杆最终选轴结果。 */
+/* 机械臂输入与主导轴选择状态。 */
 typedef struct {
     int16_t lx;
     int16_t ly;
@@ -57,7 +55,7 @@ float Grab_GetTargetAngle(GrabServoId_e id);
 /* CubeMX 已创建 GrabTask；此强定义覆盖 freertos.c 中的弱空壳。 */
 void StartGrabTask(void *argument);
 
-/* Ozone 调试变量：单位为逻辑角度，直接 watch 变量名即可。 */
+/* 舵机目标角度监视量（度）。 */
 extern volatile float g_grab_j2_target_angle_deg;
 extern volatile float g_grab_j3_target_angle_deg;
 extern volatile float g_grab_j4_target_angle_deg;

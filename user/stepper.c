@@ -90,14 +90,11 @@ void Stepper_Feed(int8_t command_sign, float dt_s)
 {
     float target_hz;
     float delta_hz;
-    int8_t bounded_command = command_sign;
 
     if (dt_s <= 0.0f) return;
-    if (bounded_command > 0 && s_position_steps >= (int32_t)STEPPER_MAX_POSITION_STEPS)
-        bounded_command = 0;
-    if (bounded_command < 0 && s_position_steps <= 0)
-        bounded_command = 0;
-    s_requested_dir = bounded_command;
+
+    /* J1 不设角度限位，累计脉冲计数仅用于监视。 */
+    s_requested_dir = command_sign;
 
     /* 换向时先减速到零，再改变 DIR，避免运行中直接反向。 */
     target_hz = (s_requested_dir != 0 && s_requested_dir == s_active_dir)
@@ -135,13 +132,7 @@ void Stepper_TIM5_PeriodElapsed(void)
     if (s_timer_running == 0U) return;
     current = HAL_GPIO_ReadPin(ARME_STEP_GPIO_Port, ARME_STEP_Pin);
     if (current == GPIO_PIN_RESET) {
-        /* 只在上升沿计一步，A4988 的 STEP 上升沿有效。 */
-        if ((s_active_dir > 0 && s_position_steps >= (int32_t)STEPPER_MAX_POSITION_STEPS) ||
-            (s_active_dir < 0 && s_position_steps <= 0)) {
-            stepper_stop_timer();
-            stepper_publish_watch(s_active_dir);
-            return;
-        }
+        /* STEP 上升沿更新相对位置计数。 */
         s_position_steps += (s_active_dir > 0) ? 1 : -1;
         HAL_GPIO_WritePin(ARME_STEP_GPIO_Port, ARME_STEP_Pin, GPIO_PIN_SET);
     } else {

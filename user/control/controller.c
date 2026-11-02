@@ -1,19 +1,6 @@
-/**
-  ******************************************************************************
-  * @file    controller.c
-  * @brief   通用 PID 控制器（源自 RM 标准库风格，本工程按其使用场景修过若干行为）。
-  *
-  * ★ 调用约定（最容易踩的坑）★
-  *   PIDCalculate(pid, measure, ref, dt_s) 的最后一个参数是
-  *   **dt_s —— 单位【秒】，不是毫秒！**
-  *   100 Hz 速度环要传 0.01f，不是 10。传错会让 I 项差 1000 倍，
-  *   现象是“车冲出去并剧烈振荡”，而代码看起来完全正常。
-  *   下面有运行期保护把 dt_s 限制在合理区间，但请仍然按约定传值。
-  *
-  * 速度环相关行为：dt_s 非法时保持输出；DeadBand > 0 时才启用误差死区。
-  * 总输出包含前馈，饱和时禁止加深饱和的积分，但允许反向释放积分。
-  ******************************************************************************
-  */
+/** @file controller.c
+ * @brief 通用 PID 控制器（源自 RM 标准库风格，本工程按其使用场景修过若干行为）。
+ */
 
 #include "controller.h"
 
@@ -53,8 +40,6 @@ void PIDReset(PIDInstance *pid) {
 void PID_FreezeIntegral(PIDInstance *pid) {
     if (pid == NULL) return;
 
-    /* Iout 非有限值（NaN/Inf，例如曾经被坏采样污染过）时直接清零，
-     * 否则任何限幅比较都会失效，积分就再也管不住了。 */
     if (!isfinite(pid->Iout)) {
         pid->Iout = 0.0f;
     }
@@ -104,11 +89,7 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref, float dt_s) {
         pid->initialized = 1U;
     }
 
-    /* ── 死区分支 ──────────────────────────────────────────────────────────
-     * 与原版的区别：不动 Output、不动 Iout，只是不再累积新的积分。
-     * 这样“误差进入死区”时输出保持在上一次的值，电机不会被突然断输出，
-     * 也就不会出现“断输出→掉速→误差变大→再给输出”的极限环。
-     * DeadBand = 0 时禁用本分支，误差恰好为零也重新合成输出及前馈。 */
+    /* 误差死区内保持输出和积分，仅更新历史值。 */
     if (pid->DeadBand > 0.0f && fabsf(pid->Err) <= pid->DeadBand) {
         pid->ITerm = 0.0f;
         pid->Last_Measure = pid->Measure;
@@ -144,7 +125,7 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref, float dt_s) {
                           / (pid->Derivative_LPF_RC + dt);
     }
 
-    /* ── 积分保持（冻结）──────────────────────────────────────────────────
+    /*  积分保持（冻结）
      * 调用方（速度环）在"低速段反馈不可信"时会调 PID_FreezeIntegral() 置位。
      * 这里让 candidate_i 保持为当前值，既不累积也不被限幅夹到别处。
      * 处理完立刻清标志，调用方不需要负责复位，因此下一个周期自动恢复正常积分。 */
@@ -157,12 +138,7 @@ float PIDCalculate(PIDInstance *pid, float measure, float ref, float dt_s) {
             candidate_i = LimitFloat(candidate_i, -pid->IntegralLimit, pid->IntegralLimit);
         }
     }
-    /* ★ 前馈必须计入饱和判断 ★
-     * pid->FeedForward 由调用方在每个周期开始前写入（占空比分数，与 Output 同量纲）。
-     * 如果前馈加在 PIDCalculate() 之外（调用方自己 +），那么下面这个抗饱和判据
-     * 就看不到真实的总输出：明明已经饱和了，PID 却以为还有余量，于是继续累积积分，
-     * 等退出饱和时就会"抽"一下。
-     * 注意分母：candidate_output 是"P+I+D"三项之和，加前馈后才是真正写入执行器的量。 */
+    /* 前馈必须计入饱和判断 */
     candidate_output = pid->Pout + candidate_i + pid->Dout + pid->FeedForward;
 
     /* 含前馈的总输出饱和时，只阻止继续加深饱和的积分增量。

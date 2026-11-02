@@ -1,4 +1,4 @@
-/**
+/*
  * ADC3 DMA -> 10 ms 测量任务 -> 独立 200 ms 显示任务。
  * 所有 OLED 事务有界，失败即放弃本帧并在离线后重试；不影响 PID。
  */
@@ -139,7 +139,7 @@ static void calibration_update(uint32_t sum_i, uint32_t n, uint32_t now) {
     s_cal_count += n;
     if ((uint32_t)(now - s_cal_since_ms) >= POWER_ZERO_CAL_WINDOW_MS) {
         if (s_cal_count >= POWER_ZERO_CAL_SAMPLES) {
-            /* 真正的实际样本数，保留均值小数位，不再固定除以 100。 */
+            /* 按实际采样次数计算校准均值。 */
             s_zero_offset_v = mean_to_volts((float)s_cal_sum / (float)s_cal_count);
             g_power_diag.zero_offset_v = s_zero_offset_v;
             g_power_diag.zero_cal_state = ZERO_CAL_OK;

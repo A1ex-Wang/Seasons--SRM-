@@ -50,7 +50,7 @@ static GrabServo_t s_servo[GRAB_SERVO_COUNT] = {
     {&htim10, TIM_CHANNEL_1,   8.0f, 175.0f,  90.0f, GRAB_COARSE_SPEED_DEG_S, GRAB_J2_DIR},
     /* J3：实物约 15 度限位，软件从 20 度开始 */
     {&htim11, TIM_CHANNEL_1,  20.0f, 175.0f,  90.0f, GRAB_COARSE_SPEED_DEG_S, GRAB_J3_DIR},
-    /* J4：硬件装反，先按角度增加为上升 */
+    /* J4：按角度增加为上升映射 */
     {&htim13, TIM_CHANNEL_1,  0.0f, 175.0f,  90.0f, GRAB_FINE_SPEED_DEG_S,   GRAB_J4_DIR},
     /* J5：DIR=1 时角度增加为逆时针，逻辑正方向要求顺时针，因此取反 */
     {&htim14, TIM_CHANNEL_1,   0.0f, 180.0f,  20.0f, GRAB_ROTATE_SPEED_DEG_S, GRAB_J5_DIR},
@@ -64,7 +64,7 @@ static int8_t s_left_axis_lock = -1;
 
 static uint32_t grab_angle_to_pulse(const GrabServo_t *servo);
 
-/* Ozone 调试专用：直接 watch 这些变量，不需要调用带形参的函数。 */
+/* 舵机目标角度与 PWM 状态快照，不参与控制计算。 */
 volatile float g_grab_j2_target_angle_deg;
 volatile float g_grab_j3_target_angle_deg;
 volatile float g_grab_j4_target_angle_deg;
@@ -136,7 +136,7 @@ static int8_t grab_axis_sign(int16_t axis)
     return 0;
 }
 
-/**
+/*
  * @brief 左摇杆单轴选择。
  *
  * 机械臂的 LX/LY 分别对应两个不同关节。操作者推动一个方向时，另一

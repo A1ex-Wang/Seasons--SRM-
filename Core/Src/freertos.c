@@ -97,27 +97,6 @@ const osThreadAttr_t RemoteTask_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
-/* Definitions for PoseTask */
-osThreadId_t PoseTaskHandle;
-const osThreadAttr_t PoseTask_attributes = {
-  .name = "PoseTask",
-  .stack_size = 768 * 4,
-  .priority = (osPriority_t) osPriorityNormal7,
-};
-/* Definitions for StrategyTask */
-osThreadId_t StrategyTaskHandle;
-const osThreadAttr_t StrategyTask_attributes = {
-  .name = "StrategyTask",
-  .stack_size = 768 * 4,
-  .priority = (osPriority_t) osPriorityNormal5,
-};
-/* Definitions for TelemetryTask */
-osThreadId_t TelemetryTaskHandle;
-const osThreadAttr_t TelemetryTask_attributes = {
-  .name = "TelemetryTask",
-  .stack_size = 768 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
 /* Definitions for remote_chassis */
 osMessageQueueId_t remote_chassisHandle;
 uint8_t remote_chassisBuffer[ 6 * sizeof( uint16_t ) ];
@@ -142,9 +121,6 @@ void StartSensorImuTask(void *argument);
 void StartOLEDPower(void *argument);
 void StartGrabTask(void *argument);
 void StartRemoteTask(void *argument);
-void StarPoseTask(void *argument);
-void StartStrategyTask(void *argument);
-void StartTelemetryTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -199,15 +175,6 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of RemoteTask */
   RemoteTaskHandle = osThreadNew(StartRemoteTask, NULL, &RemoteTask_attributes);
-
-  /* creation of PoseTask */
-  PoseTaskHandle = osThreadNew(StarPoseTask, NULL, &PoseTask_attributes);
-
-  /* creation of StrategyTask */
-  StrategyTaskHandle = osThreadNew(StartStrategyTask, NULL, &StrategyTask_attributes);
-
-  /* creation of TelemetryTask */
-  TelemetryTaskHandle = osThreadNew(StartTelemetryTask, NULL, &TelemetryTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -343,60 +310,6 @@ __weak void StartRemoteTask(void *argument)
     osDelay(1);
   }
   /* USER CODE END StartRemoteTask */
-}
-
-/* USER CODE BEGIN Header_StarPoseTask */
-/**
-* @brief Function implementing the PoseTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StarPoseTask */
-__weak void StarPoseTask(void *argument)
-{
-  /* USER CODE BEGIN StarPoseTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StarPoseTask */
-}
-
-/* USER CODE BEGIN Header_StartStrategyTask */
-/**
-* @brief Function implementing the StrategyTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartStrategyTask */
-__weak void StartStrategyTask(void *argument)
-{
-  /* USER CODE BEGIN StartStrategyTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartStrategyTask */
-}
-
-/* USER CODE BEGIN Header_StartTelemetryTask */
-/**
-* @brief Function implementing the TelemetryTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartTelemetryTask */
-__weak void StartTelemetryTask(void *argument)
-{
-  /* USER CODE BEGIN StartTelemetryTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartTelemetryTask */
 }
 
 /* Private application code --------------------------------------------------*/
